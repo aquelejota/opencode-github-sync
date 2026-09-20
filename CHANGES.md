@@ -50,3 +50,15 @@ Base: **opencode-github-sync 3.0.1** (MIT) by [@doomsday616](https://github.com/
 
 - The first export after switching rewrites every shard once, because the stable `exportedAt` value differs from the old wall-clock one. One large commit, then incremental.
 - No settings or shard-format changes: CLI, overrides, `extraPaths` and the `opencode_sync` tool behave as before.
+
+## Distribution note (opencode 1.18.31)
+
+On opencode 1.18.31 installing a plugin from an npm/git spec failed silently on our machines: the package was fetched to `~/.cache/opencode/packages/`, but the plugin module was never imported — no error toast, no log line. The working path was a local file plugin that re-exports the vendored `dist/`:
+
+```js
+// ~/.config/opencode/plugins/opencode-sync-fork.js
+export { default } from "../vendor/opencode-github-sync/dist/plugin/index.js";
+```
+
+Both machines run it this way, with `vendor/` carried inside the synced config repository. The npm/git spec remains the intended install path once the loader issue is understood.
+

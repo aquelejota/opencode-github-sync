@@ -80,6 +80,20 @@ As an OpenCode plugin, pointing at this fork:
 
 The build output (`dist/`) is committed, so no build step is needed on install.
 
+> **Caveat (observed on opencode 1.18.31).** Installing a plugin from an npm/git spec can fail *silently*: the package is fetched into `~/.cache/opencode/packages/`, but the plugin is never imported — no toast, no log line. If the startup pull never runs, vendor `dist/` into your config and load it from a local plugin file instead (this path is proven and syncs with the rest of your config):
+>
+> ```bash
+> mkdir -p ~/.config/opencode/vendor/opencode-github-sync
+> cp -r dist ~/.config/opencode/vendor/opencode-github-sync/
+> ```
+>
+> ```js
+> // ~/.config/opencode/plugins/opencode-sync-fork.js
+> export { default } from "../vendor/opencode-github-sync/dist/plugin/index.js";
+> ```
+>
+> Then keep `"opencode-github-sync"` out of the `plugin` array and update `vendor/` from this repository when you pull a new version.
+
 CLI, if you want the rescue path too:
 
 ```bash
