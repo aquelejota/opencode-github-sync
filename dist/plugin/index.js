@@ -68,14 +68,6 @@ function isConfigured() {
  */
 function runSync(client, action) {
     return new Promise((resolve, reject) => {
-        let worker;
-        try {
-            worker = new Worker(WORKER_FILE, { workerData: { action } });
-        }
-        catch (error) {
-            reject(error);
-            return;
-        }
         let settled = false;
         let announced = false;
         let shards = 0;
@@ -114,6 +106,15 @@ function runSync(client, action) {
             void toast(client, `Sync failed: ${message}`, "error");
             reject(error);
         };
+        let worker;
+        try {
+            worker = new Worker(WORKER_FILE, { workerData: { action } });
+        }
+        catch (error) {
+            // Never fail silently: a missing worker file used to make this a no-op.
+            fail(error.message, error);
+            return;
+        }
         worker.on("message", (message) => {
             lastEventAt = Date.now();
             switch (message.type) {
@@ -190,6 +191,7 @@ function runSync(client, action) {
 export const OpencodeGithubSync = async (ctx) => {
     const client = ctx?.client;
     const roots = getRoots();
+    await log(client, "info", "opencode-github-sync plugin loaded");
     if (!isConfigured()) {
         await log(client, "info", "opencode-github-sync is installed but no repository is configured. Run `opencode-sync init`.");
         return {};

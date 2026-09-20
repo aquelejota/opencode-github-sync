@@ -91,14 +91,6 @@ function isConfigured(): boolean {
  */
 function runSync(client: any, action: SyncAction): Promise<SyncOutcome> {
   return new Promise((resolve, reject) => {
-    let worker: Worker;
-    try {
-      worker = new Worker(WORKER_FILE, { workerData: { action } });
-    } catch (error) {
-      reject(error);
-      return;
-    }
-
     let settled = false;
     let announced = false;
     let shards = 0;
@@ -138,6 +130,15 @@ function runSync(client: any, action: SyncAction): Promise<SyncOutcome> {
       void toast(client, `Sync failed: ${message}`, "error");
       reject(error);
     };
+
+    let worker: Worker;
+    try {
+      worker = new Worker(WORKER_FILE, { workerData: { action } });
+    } catch (error) {
+      // Never fail silently: a missing worker file used to make this a no-op.
+      fail((error as Error).message, error);
+      return;
+    }
 
     worker.on("message", (message: WorkerMessage) => {
       lastEventAt = Date.now();
@@ -215,6 +216,8 @@ function runSync(client: any, action: SyncAction): Promise<SyncOutcome> {
 export const OpencodeGithubSync = async (ctx: PluginContext) => {
   const client = ctx?.client;
   const roots = getRoots();
+
+  await log(client, "info", "opencode-github-sync plugin loaded");
 
   if (!isConfigured()) {
     await log(
