@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { gunzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { silentReporter } from "../src/core/reporter.js";
 import {
@@ -26,7 +27,8 @@ CREATE TABLE project (
 CREATE TABLE session (
   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, slug TEXT NOT NULL,
   directory TEXT NOT NULL, title TEXT NOT NULL, version TEXT NOT NULL,
-  time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, workspace_id TEXT
+  time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, workspace_id TEXT,
+  FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
 );
 CREATE TABLE message (
   id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
@@ -280,6 +282,65 @@ describe("export and import", () => {
 
     expect(exported.skippedTooLarge.map((s) => s.id)).toContain("ses_recent");
     expect(fs.existsSync(path.join(repo, "_sessions", "ses_recent.json.gz"))).toBe(false);
+  });
+
+  it("keeps every session when shards share one project", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const source = path.join(root, "source.sqlite");
+    const repo = path.join(root, "repo");
+    fs.mkdirSync(repo, { recursive: true });
+    await makeDatabase(source, now);
+
+    await exportSessions(source, repo, { ...settings(), now }, silentReporter);
+
+    const target = path.join(root, "target.sqlite");
+    const empty = await openDatabase(target);
+    empty.exec(SCHEMA);
+    empty.close();
+
+    const result = await importSessions(target, repo, silentReporter);
+    expect(result.imported).toBe(2);
+    expect(result.failed).toEqual([]);
+
+    const db = await openDatabase(target, { readOnly: true });
+    const sessions = db.prepare("SELECT id FROM session ORDER BY id").all() as { id: string }[];
+    const projects = db.prepare("SELECT id FROM project").all() as { id: string }[];
+    db.close();
+
+    // Re-inserting the shared project used to cascade-delete the session that
+    // was imported first, leaving only the last one behind.
+    expect(projects.map((p) => p.id)).toEqual(["prj_1"]);
+    expect(sessions.map((s) => s.id)).toEqual(["ses_alsorecent", "ses_recent"]);
+  });
+
+  it("does not export the synthetic global project row", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const source = path.join(root, "source.sqlite");
+    const repo = path.join(root, "repo");
+    fs.mkdirSync(repo, { recursive: true });
+
+    const db = await openDatabase(source);
+    db.exec(SCHEMA);
+    db.prepare(
+      "INSERT INTO project (id, worktree, name, time_created, time_updated, sandboxes) VALUES (?,?,?,?,?,?)",
+    ).run("global", "/machine-specific", "global", now, now, "[]");
+    db.prepare(
+      `INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+       VALUES (?,?,?,?,?,?,?,?)`,
+    ).run("ses_global", "global", "s", "/work/app", "Global", "1.0.0", now - DAY, now);
+    db.close();
+
+    await exportSessions(source, repo, { ...settings(), now }, silentReporter);
+
+    const shard = JSON.parse(
+      gunzipSync(fs.readFileSync(path.join(repo, "_sessions", "ses_global.json.gz"))).toString(
+        "utf8",
+      ),
+    );
+    expect(shard.session.id).toBe("ses_global");
+    expect(shard.project).toBeUndefined();
   });
 
   it("removes shards that fall out of the retention window", async () => {

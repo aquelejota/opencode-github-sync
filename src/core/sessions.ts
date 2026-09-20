@@ -172,7 +172,10 @@ function buildShard(db: SqliteDatabase, sessionId: string, tables: string[]): Se
   };
 
   const projectId = sessionRow.project_id;
-  if (projectId) {
+  // `global` is OpenCode's synthetic project row and its worktree/vcs metadata
+  // is machine-specific. Shipping it would overwrite the receiving machine's
+  // own row on import, and the next export would then see it as changed again.
+  if (projectId && projectId !== "global") {
     shard.project = readRows(db, "SELECT * FROM project WHERE id = ?", [projectId])[0];
   }
   const workspaceId = (sessionRow as any).workspace_id;
@@ -288,9 +291,16 @@ function upsert(
   if (columns.length === 0) return;
   const placeholders = columns.map(() => "?").join(", ");
   const quoted = columns.map((column) => `"${column}"`).join(", ");
-  db.prepare(`INSERT OR REPLACE INTO "${table}" (${quoted}) VALUES (${placeholders})`).run(
-    ...columns.map((column) => normalize(row[column])),
-  );
+  // A true UPSERT, never INSERT OR REPLACE. REPLACE deletes the conflicting
+  // row before inserting the replacement, and deleting a `project` row cascades
+  // through `session.project_id -> project.id ON DELETE CASCADE` — silently
+  // wiping every session already imported in the same run when shards share a
+  // project (they all do: `global`). DO UPDATE never deletes.
+  const assignments = columns.map((column) => `"${column}" = excluded."${column}"`).join(", ");
+  db.prepare(
+    `INSERT INTO "${table}" (${quoted}) VALUES (${placeholders}) ` +
+      `ON CONFLICT DO UPDATE SET ${assignments}`,
+  ).run(...columns.map((column) => normalize(row[column])));
 }
 
 /** SQLite drivers accept null/number/string/bigint/Buffer only. */
