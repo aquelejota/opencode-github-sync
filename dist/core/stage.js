@@ -59,14 +59,14 @@ export function stageIn(ctx) {
     for (const rel of DATA_PATHS) {
         copyPath(path.join(roots.data, rel), path.join(repoData, rel));
     }
-    if (settings.includeState) {
-        if (fs.existsSync(roots.state)) {
-            removeRecursive(repoState);
-            copyDirRecursive(roots.state, repoState, { excludeFiles: MACHINE_STATE_FILES });
-        }
-        else {
-            removeRecursive(repoState);
-        }
+    if (settings.includeState && fs.existsSync(roots.state)) {
+        removeRecursive(repoState);
+        copyDirRecursive(roots.state, repoState, { excludeFiles: MACHINE_STATE_FILES });
+    }
+    else {
+        // Turning the option off must also drop whatever was synced before, the
+        // same way a credential file disappears when credentials are disabled.
+        removeRecursive(repoState);
     }
     if (settings.includeSkills) {
         syncDirIncremental(roots.agents, repoAgents, {

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { gunzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { silentReporter } from "../src/core/reporter.js";
 import {
@@ -374,6 +374,92 @@ describe("export and import", () => {
     // An unchanged session must not produce a new diff on every push — same
     // bytes, same mtime, no diff for git to pick up.
     expect(fs.readFileSync(shard).equals(before)).toBe(true);
+  });
+
+  it("does not rewrite a shard whose content is unchanged but whose bytes differ", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const source = path.join(root, "source.sqlite");
+    const repo = path.join(root, "repo");
+    fs.mkdirSync(repo, { recursive: true });
+    await makeDatabase(source, now);
+
+    await exportSessions(source, repo, { ...settings(), now }, silentReporter);
+    const shard = path.join(repo, "_sessions", "ses_recent.json.gz");
+
+    // Simulate a shard written by a machine whose zlib produces different
+    // compressed bytes for the same JSON: same content, different bytes.
+    const content = gunzipSync(fs.readFileSync(shard));
+    fs.writeFileSync(shard, gzipSync(content, { level: 1 }));
+    const before = fs.readFileSync(shard);
+
+    await exportSessions(source, repo, { ...settings(), now }, silentReporter);
+
+    // Content equality, not byte equality, decides whether to rewrite.
+    expect(fs.readFileSync(shard).equals(before)).toBe(true);
+  });
+
+  it("exports the same content regardless of the local row order", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const repoA = path.join(root, "repo-a");
+    const repoB = path.join(root, "repo-b");
+    fs.mkdirSync(repoA, { recursive: true });
+    fs.mkdirSync(repoB, { recursive: true });
+
+    const dbA = path.join(root, "a.sqlite");
+    const dbB = path.join(root, "b.sqlite");
+    await makeDatabase(dbA, now);
+    await makeDatabase(dbB, now);
+
+    // Two machines holding the same rows, inserted in opposite orders: the
+    // rowids — and therefore the raw SELECT order — differ, the content does
+    // not. SQLite has no reason to return them in the same order.
+    const addRows = async (file: string, parts: string[], todos: number[]): Promise<void> => {
+      const db = await openDatabase(file);
+      for (const id of parts) {
+        db.prepare(
+          "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?,?)",
+        ).run(id, "msg_ses_recent", "ses_recent", now, now, JSON.stringify({ text: id }));
+      }
+      for (const position of todos) {
+        db.prepare(
+          `INSERT INTO todo (session_id, content, status, priority, position, time_created, time_updated)
+           VALUES (?,?,?,?,?,?,?)`,
+        ).run("ses_recent", `todo ${position}`, "pending", "high", position, now, now);
+      }
+      db.close();
+    };
+    await addRows(dbA, ["prt_aaa", "prt_bbb"], [1, 2]);
+    await addRows(dbB, ["prt_bbb", "prt_aaa"], [2, 1]);
+
+    await exportSessions(dbA, repoA, { ...settings(), now }, silentReporter);
+    await exportSessions(dbB, repoB, { ...settings(), now }, silentReporter);
+
+    const read = (repo: string): unknown =>
+      JSON.parse(
+        gunzipSync(fs.readFileSync(path.join(repo, "_sessions", "ses_recent.json.gz"))).toString(
+          "utf8",
+        ),
+      );
+    expect(read(repoB)).toEqual(read(repoA));
+  });
+
+  it("reports changed and unchanged sessions separately", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const source = path.join(root, "source.sqlite");
+    const repo = path.join(root, "repo");
+    fs.mkdirSync(repo, { recursive: true });
+    await makeDatabase(source, now);
+
+    const first = await exportSessions(source, repo, { ...settings(), now }, silentReporter);
+    expect(first.written.sort()).toEqual(["ses_alsorecent", "ses_recent"]);
+    expect(first.unchanged).toEqual([]);
+
+    const second = await exportSessions(source, repo, { ...settings(), now }, silentReporter);
+    expect(second.written).toEqual([]);
+    expect(second.unchanged.sort()).toEqual(["ses_alsorecent", "ses_recent"]);
   });
 });
 

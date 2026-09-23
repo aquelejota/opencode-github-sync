@@ -121,7 +121,7 @@ function pushBranch(ctx, alreadyCommitted) {
         return;
     }
     const rebase = git(["pull", "--rebase", "origin", branch], { cwd: root });
-    if (!rebase.ok) {
+    if (!rebase.ok && !resolveDerivedConflicts(ctx)) {
         git(["rebase", "--abort"], { cwd: root });
         throw new SyncError("The remote has changes that conflict with this machine.\n" +
             "Run `opencode-sync pull` to take the remote version, or `opencode-sync push --force` to overwrite it.");
@@ -131,6 +131,77 @@ function pushBranch(ctx, alreadyCommitted) {
         throw toGitError("Push", result);
     assertPushLanded(root, branch, "Push");
     void alreadyCommitted;
+}
+/**
+ * Repository paths that are regenerated from local state rather than authored.
+ *
+ * The repository is an artifact of the database and the local configuration,
+ * not a source of truth: replaying history file by file for these paths is
+ * pointless. A conflict confined to them can be resolved automatically — this
+ * machine's copy wins, and the other machine re-exports and re-pushes whenever
+ * its own copy is newer. Anything else is real authored content and still
+ * needs a human.
+ */
+const DERIVED_PATHS = ["_sessions", "_state", "_data"];
+/** Credentials are user-managed, never derived — never auto-resolved. */
+const DERIVED_EXCEPTIONS = new Set(["_data/auth.json", "_data/account.json"]);
+function isDerivedPath(file) {
+    const normalized = String(file ?? "").replace(/\\/g, "/");
+    if (DERIVED_EXCEPTIONS.has(normalized))
+        return false;
+    return DERIVED_PATHS.some((dir) => normalized === dir || normalized.startsWith(`${dir}/`));
+}
+/** How many conflict rounds a single push may auto-resolve before giving up. */
+const REBASE_RESOLVE_LIMIT = 10;
+/**
+ * Resolve a conflicted rebase when every conflict sits in a derived path.
+ *
+ * Called while `pull --rebase` is paused. Returns true when the rebase was
+ * carried to completion (or had nothing left to resolve); false when a
+ * conflict needs a human or the rebase cannot be advanced. The caller aborts
+ * the rebase on false, so a half-resolved state is never left behind.
+ */
+function resolveDerivedConflicts(ctx) {
+    const { root, reporter } = ctx;
+    let resolved = 0;
+    for (let round = 0; round < REBASE_RESOLVE_LIMIT; round++) {
+        const conflicts = git(["diff", "--name-only", "--diff-filter=U"], { cwd: root });
+        if (!conflicts.ok)
+            return false;
+        const files = conflicts.stdout
+            .split("\n")
+            .map((line) => line.trim())
+            .filter(Boolean);
+        if (files.length === 0) {
+            if (resolved > 0) {
+                reporter.detail(`Auto-resolved ${resolved} conflicting derived file(s)`);
+            }
+            return true;
+        }
+        if (!files.every(isDerivedPath))
+            return false;
+        for (const file of files) {
+            // During a rebase the sides are swapped: "theirs" is the commit being
+            // replayed — this machine's version.
+            if (git(["checkout", "--theirs", "--", file], { cwd: root }).ok) {
+                if (!git(["add", "--", file], { cwd: root }).ok)
+                    return false;
+                resolved++;
+                continue;
+            }
+            // Delete/modify conflict: when this machine deleted the file, keep the
+            // deletion; otherwise there is no local copy to prefer.
+            if (git(["cat-file", "-e", `:3:${file}`], { cwd: root }).ok)
+                return false;
+            if (!git(["rm", "-f", "--", file], { cwd: root }).ok)
+                return false;
+            resolved++;
+        }
+        const continued = git(["-c", "core.editor=true", "rebase", "--continue"], { cwd: root });
+        if (!continued.ok)
+            return false;
+    }
+    return false;
 }
 // ── Pull ────────────────────────────────────────────────────────────────────
 export async function pull(options = {}) {

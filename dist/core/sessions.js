@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { ensureDir } from "./fsx.js";
 import { SESSIONS_DIR } from "./paths.js";
@@ -48,6 +49,34 @@ export function sanitizeId(id) {
 }
 function readRows(db, sql, params) {
     return db.prepare(sql).all(...params);
+}
+/**
+ * Put a table's rows in a stable order that does not depend on local rowids.
+ *
+ * SQLite returns rows in rowid order unless the query says otherwise, and
+ * rowids are a per-machine insertion artifact: two machines holding the same
+ * rows serialize the same JSON in different array orders. The shard comparison
+ * is positional (arrays are ordered), so each machine used to rewrite the
+ * other's shards on every alternation. Sorting by a value derived from the row
+ * itself makes the export deterministic everywhere.
+ */
+function canonicalRows(rows) {
+    return [...rows].sort((a, b) => {
+        const left = canonicalRowKey(a);
+        const right = canonicalRowKey(b);
+        return left < right ? -1 : left > right ? 1 : 0;
+    });
+}
+/**
+ * Ids sort naturally; tables without one (`todo`, `session_context_epoch`) fall
+ * back to their canonical JSON, keys sorted, so the local schema's column order
+ * never leaks into the comparison.
+ */
+function canonicalRowKey(row) {
+    const id = row.id;
+    if (typeof id === "string")
+        return id;
+    return JSON.stringify(row, Object.keys(row).sort());
 }
 /**
  * Choose which sessions to export.
@@ -127,15 +156,13 @@ function buildShard(db, sessionId, tables) {
             shard.workspace = rows[0];
     }
     for (const table of tables) {
-        shard.tables[table] = readRows(db, `SELECT * FROM "${table}" WHERE session_id = ?`, [
-            sessionId,
-        ]);
+        shard.tables[table] = canonicalRows(readRows(db, `SELECT * FROM "${table}" WHERE session_id = ?`, [sessionId]));
     }
     return shard;
 }
 /** Export the selected sessions into `<repo>/_sessions`. */
 export async function exportSessions(databaseFile, repoRoot, options, reporter) {
-    const result = { written: [], skippedTooLarge: [], considered: 0 };
+    const result = { written: [], unchanged: [], skippedTooLarge: [], considered: 0 };
     if (!fs.existsSync(databaseFile))
         return result;
     const db = await openDatabase(databaseFile, { readOnly: true });
@@ -148,7 +175,16 @@ export async function exportSessions(databaseFile, repoRoot, options, reporter) 
         const keep = new Set();
         for (const session of sessions) {
             const shard = buildShard(db, session.id, tables);
-            const payload = gzipSync(Buffer.from(JSON.stringify(shard)), { level: 9 });
+            const json = Buffer.from(JSON.stringify(shard));
+            const file = shardPath(repoRoot, session.id);
+            if (fs.existsSync(file) && shardContentEquals(file, json)) {
+                keep.add(path.basename(file));
+                result.unchanged.push(session.id);
+                continue;
+            }
+            // Compressing is the expensive half of an export, so it only happens
+            // when the shard is actually going to be written.
+            const payload = gzipSync(json, { level: 9 });
             if (payload.byteLength > options.maxSessionBytes) {
                 result.skippedTooLarge.push({
                     id: session.id,
@@ -157,13 +193,8 @@ export async function exportSessions(databaseFile, repoRoot, options, reporter) 
                 });
                 continue;
             }
-            const file = shardPath(repoRoot, session.id);
             keep.add(path.basename(file));
-            // Only rewrite when the payload actually changed, otherwise every push
-            // would produce a diff for every session purely from the gzip timestamp.
-            if (!fs.existsSync(file) || !fs.readFileSync(file).equals(payload)) {
-                fs.writeFileSync(file, payload);
-            }
+            fs.writeFileSync(file, payload);
             result.written.push(session.id);
         }
         pruneShards(outDir, keep, options, reporter);
@@ -193,6 +224,32 @@ function pruneShards(outDir, keep, options, reporter) {
     }
     if (removed > 0)
         reporter.detail(`Removed ${removed} session shard(s) outside the retention window`);
+}
+/**
+ * True when the shard on disk already holds this exact content.
+ *
+ * Compressed bytes are a poor identity: two machines, or two zlib builds,
+ * produce different gzip output for the same JSON. Comparing those bytes used
+ * to rewrite every shard on every export, turning each push into a
+ * whole-repository diff. The fast path compares the uncompressed bytes; when
+ * those differ, a deep compare still rules out a mere key-order difference.
+ */
+function shardContentEquals(file, json) {
+    let existing;
+    try {
+        existing = gunzipSync(fs.readFileSync(file));
+    }
+    catch {
+        return false;
+    }
+    if (existing.equals(json))
+        return true;
+    try {
+        return isDeepStrictEqual(JSON.parse(existing.toString("utf8")), JSON.parse(json.toString("utf8")));
+    }
+    catch {
+        return false;
+    }
 }
 function readShard(file) {
     const raw = gunzipSync(fs.readFileSync(file));

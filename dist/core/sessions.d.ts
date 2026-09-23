@@ -26,7 +26,10 @@ export interface SelectOptions extends SessionSettings {
     now?: number;
 }
 export interface ExportResult {
+    /** Sessions whose shard was written or rewritten. */
     written: string[];
+    /** Sessions whose shard on disk already had this exact content. */
+    unchanged: string[];
     skippedTooLarge: {
         id: string;
         title: string;

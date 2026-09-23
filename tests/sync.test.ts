@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { gzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { git } from "../src/core/git.js";
 import { getRoots } from "../src/core/paths.js";
@@ -89,6 +90,12 @@ const write = (file: string, content: string): void => {
 };
 
 const read = (file: string): string => fs.readFileSync(file, "utf8");
+
+const shardBytes = (value: unknown): Buffer => gzipSync(Buffer.from(JSON.stringify(value)));
+
+/** Read a file straight from the bare remote's tip, bytes included. */
+const remoteFile = (file: string): Buffer =>
+  execFileSync("git", ["--git-dir", remote, "show", `main:${file}`]);
 
 describe("push and pull", () => {
   it("moves configuration from one machine to another", async () => {
@@ -193,6 +200,74 @@ describe("push and pull", () => {
 
     await pull({ settings: settings(), roots: getRoots(), force: true });
     expect(read(path.join(b.config, "opencode.jsonc"))).toContain("shared");
+  });
+
+  it("removes state from the repository when the option is turned off", async () => {
+    const a = makeMachine("a");
+    useMachine(a);
+    write(path.join(a.config, "opencode.jsonc"), "{}\n");
+    write(path.join(a.state, "model.json"), '{ "model": "x" }\n');
+
+    await push({ settings: settings({ includeState: true }), roots: getRoots() });
+    let tracked = execFileSync("git", ["ls-files"], { cwd: a.config, encoding: "utf8" });
+    expect(tracked).toMatch(/_state\/model\.json/);
+
+    await push({ settings: settings({ includeState: false }), roots: getRoots() });
+    tracked = execFileSync("git", ["ls-files"], { cwd: a.config, encoding: "utf8" });
+    expect(tracked).not.toMatch(/_state\//);
+  });
+
+  it("auto-resolves a rebase conflict confined to derived paths", async () => {
+    const a = makeMachine("a");
+    useMachine(a);
+    write(path.join(a.config, "opencode.jsonc"), "{}\n");
+    const shardA = path.join(a.config, "_sessions", "ses_x.json.gz");
+    fs.mkdirSync(path.dirname(shardA), { recursive: true });
+    fs.writeFileSync(shardA, shardBytes({ v: 1 }));
+    await push({ settings: settings(), roots: getRoots() });
+
+    const b = makeMachine("b");
+    useMachine(b);
+    await pull({ settings: settings(), roots: getRoots() });
+
+    // A advances the shard while B is offline.
+    useMachine(a);
+    fs.writeFileSync(shardA, shardBytes({ v: 2 }));
+    await push({ settings: settings(), roots: getRoots() });
+
+    // B changed the same shard from its own stale copy: binary conflict.
+    useMachine(b);
+    const shardB = path.join(b.config, "_sessions", "ses_x.json.gz");
+    fs.writeFileSync(shardB, shardBytes({ v: 3 }));
+
+    const pushed = await push({
+      settings: settings(),
+      roots: getRoots(),
+      reporter: new CollectingReporter(),
+    });
+
+    expect(pushed.changed).toBe(true);
+    // This machine's version wins; the other machine re-exports its newer copy.
+    expect(remoteFile("_sessions/ses_x.json.gz").equals(shardBytes({ v: 3 }))).toBe(true);
+  });
+
+  it("still refuses a rebase conflict outside derived paths", async () => {
+    const a = makeMachine("a");
+    useMachine(a);
+    write(path.join(a.config, "opencode.jsonc"), '{ "a": 1 }\n');
+    await push({ settings: settings(), roots: getRoots() });
+
+    const b = makeMachine("b");
+    useMachine(b);
+    await pull({ settings: settings(), roots: getRoots() });
+
+    useMachine(a);
+    write(path.join(a.config, "opencode.jsonc"), '{ "a": 2 }\n');
+    await push({ settings: settings(), roots: getRoots() });
+
+    useMachine(b);
+    write(path.join(b.config, "opencode.jsonc"), '{ "b": 2 }\n');
+    await expect(push({ settings: settings(), roots: getRoots() })).rejects.toThrow(/conflict/i);
   });
 
   it("keeps uncommitted local edits through a pull", async () => {
