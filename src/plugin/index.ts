@@ -3,6 +3,7 @@ import { Worker } from "node:worker_threads";
 import { getRoots } from "../core/paths.js";
 import { loadSettings, repoUrl, settingsPath } from "../core/settings.js";
 import { status } from "../core/sync.js";
+import { appendProgress, beginProgress } from "./progress-file.js";
 import {
   type SyncAction,
   type ToastVariant,
@@ -93,6 +94,17 @@ function isConfigured(): boolean {
  */
 function runSync(client: any, action: SyncAction): Promise<SyncOutcome> {
   return new Promise((resolve, reject) => {
+    const roots = getRoots();
+    beginProgress(roots, action);
+    /**
+     * Show a toast wherever a TUI can see it: through the V1 client when there
+     * is one, and through the progress log the V2 CLI plugin (`src/tui.ts`)
+     * tails. `client` is undefined on V2, where the log is the only channel.
+     */
+    const show = (message: string, variant: ToastVariant) => {
+      void toast(client, message, variant);
+      appendProgress(roots, message, variant);
+    };
     let settled = false;
     let announced = false;
     let shards = 0;
@@ -103,20 +115,20 @@ function runSync(client: any, action: SyncAction): Promise<SyncOutcome> {
     const announceTimer = setTimeout(() => {
       if (settled) return;
       announced = true;
-      void toast(client, `Sync: ${phase}…`, "info");
+      show(`Sync: ${phase}…`, "info");
     }, ANNOUNCE_AFTER_MS);
 
     const heartbeat = setInterval(() => {
       if (settled) return;
       if (!announced) {
         announced = true;
-        void toast(client, `Sync: ${phase}…`, "info");
+        show(`Sync: ${phase}…`, "info");
         return;
       }
       const now = Date.now();
       if (now - lastEventAt < HEARTBEAT_MS) return;
       lastEventAt = now;
-      void toast(client, `Sync: ${phase}… (${formatDuration((now - startedAt) / 1000)})`, "info");
+      show(`Sync: ${phase}… (${formatDuration((now - startedAt) / 1000)})`, "info");
     }, 5_000);
     heartbeat.unref?.();
 
@@ -129,7 +141,7 @@ function runSync(client: any, action: SyncAction): Promise<SyncOutcome> {
     const fail = (message: string, error: unknown) => {
       finish();
       void log(client, "error", `sync ${action} failed: ${message}`);
-      void toast(client, `Sync failed: ${message}`, "error");
+      show(`Sync failed: ${message}`, "error");
       reject(error);
     };
 
@@ -151,7 +163,7 @@ function runSync(client: any, action: SyncAction): Promise<SyncOutcome> {
         case "log":
           if (message.level === "step") {
             phase = phaseLabel(message.message, shards);
-            if (announced) void toast(client, `Sync: ${phase}…`, "info");
+            if (announced) show(`Sync: ${phase}…`, "info");
             void log(client, "info", message.message);
           } else if (message.level === "detail") {
             void log(client, "debug", message.message);
@@ -162,7 +174,7 @@ function runSync(client: any, action: SyncAction): Promise<SyncOutcome> {
         case "changes":
           if (message.count > 0) {
             phase = `${message.count} file(s) to apply`;
-            if (announced) void toast(client, `Sync: ${phase}…`, "info");
+            if (announced) show(`Sync: ${phase}…`, "info");
           }
           return;
         case "done": {
@@ -170,19 +182,15 @@ function runSync(client: any, action: SyncAction): Promise<SyncOutcome> {
           void log(client, "info", `sync ${action}: files=${message.files} ${duration}`);
           if (action === "push") {
             if (message.files > 0) {
-              void toast(client, `Sync: sent ${message.files} file(s) in ${duration}`, "success");
+              show(`Sync: sent ${message.files} file(s) in ${duration}`, "success");
             } else if (announced) {
-              void toast(client, `Sync: nothing to send (${duration})`, "info");
+              show(`Sync: nothing to send (${duration})`, "info");
             }
           } else if (message.files > 0) {
             const restart = message.restartRequired ? " — restart OpenCode to apply" : "";
-            void toast(
-              client,
-              `Sync: applied ${message.files} file(s) in ${duration}${restart}`,
-              "success",
-            );
+            show(`Sync: applied ${message.files} file(s) in ${duration}${restart}`, "success");
           } else if (announced) {
-            void toast(client, `Sync: already up to date (${duration})`, "info");
+            show(`Sync: already up to date (${duration})`, "info");
           }
           finish();
           resolve({
@@ -320,8 +328,9 @@ interface PluginV2Context {
  * before. V2 hosts call `setup()` and register the same behavior through the V2
  * context: pull on startup, push on idle, the `opencode_sync` tool, and cleanup.
  *
- * V2 status: partial. Progress toasts still live on the V1 path; port them with
- * the V2 TUI/RPC API before relying on this plugin under OpenCode 2.
+ * V2 status: complete. V1 shows progress through client toasts; V2 runs in the
+ * service, so the same toasts are appended to the progress log and `src/tui.ts`
+ * (the CLI plugin the TUI loads) shows them — see `progress-file.ts`.
  */
 export default {
   id: "opencode-github-sync",

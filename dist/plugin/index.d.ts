@@ -63,8 +63,9 @@ interface PluginV2Context {
  * before. V2 hosts call `setup()` and register the same behavior through the V2
  * context: pull on startup, push on idle, the `opencode_sync` tool, and cleanup.
  *
- * V2 status: partial. Progress toasts still live on the V1 path; port them with
- * the V2 TUI/RPC API before relying on this plugin under OpenCode 2.
+ * V2 status: complete. V1 shows progress through client toasts; V2 runs in the
+ * service, so the same toasts are appended to the progress log and `src/tui.ts`
+ * (the CLI plugin the TUI loads) shows them — see `progress-file.ts`.
  */
 declare const _default: {
     id: string;

@@ -32,6 +32,10 @@
       "types": "./dist/plugin/index.d.ts",
       "default": "./dist/plugin/index.js"
     },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "default": "./dist/tui.js"
+    },
     "./core": {
       "types": "./dist/core/index.d.ts",
       "default": "./dist/core/index.js"

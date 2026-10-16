@@ -88,6 +88,16 @@ Base: **opencode-github-sync 3.0.1** (MIT) by [@doomsday616](https://github.com/
 
 **Evidence (production, 2026-10-16).** The idle auto-push produced `sync: 2026-10-16 15:24:33 from ryzendeb` right after a run, using the new event.
 
+## 9. Sync progress toasts in the OpenCode 2 TUI (2026-10-16)
+
+**Problem.** Under V2 the plugin runs inside the background service — a different process from the TUI — so `client.tui.showToast`, the V1 flash channel, does not exist and every sync ran silently: no phases, no heartbeat, no result, no failures.
+
+**Fix.** The plugin appends every toast it would show — same messages, same variants — to a JSONL log under the state root (`src/plugin/progress-file.ts`, a `begin` marker per run), and a CLI plugin (`src/tui.ts`, exposed through the `tui` entrypoint: the loader calls `setup(context)`) tails the file and shows `ui.toast.show` in the TUI. The state root stays out of the sync, the log rotates on each run, and both write and read failures are swallowed on purpose — the progress trail must never break a sync.
+
+**Evidence (production, 2026-10-16).** On a real push: `Sync: exporting sessions…` → `Sync: 22 file(s) to apply…` → `Sync: sent 22 file(s) in 16s` appeared in the TUI (v2.0.31), matching the V1 wording. 6 new tests (`tests/progress-file.test.ts`); 117 green.
+
+**Deploy note.** The service does not hot-reload plugins the way the TUI does: after updating the vendored `dist`, restart the service so the new code loads.
+
 ## Migration notes
 
 - The first export after switching rewrites every shard once, because the stable `exportedAt` value differs from the old wall-clock one. One large commit, then incremental.
