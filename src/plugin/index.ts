@@ -213,6 +213,39 @@ function runSync(client: any, action: SyncAction): Promise<SyncOutcome> {
   });
 }
 
+const SYNC_TOOL_DESCRIPTION =
+  "Sync OpenCode configuration with the GitHub sync repository. " +
+  "Use action 'push' to upload this machine's configuration, 'pull' to apply the shared " +
+  "configuration, or 'status' to report what is out of sync.";
+
+/**
+ * Shared implementation behind the `opencode_sync` tool in both entrypoints.
+ * `client` is optional: the V2 setup has no TUI client, and toast/log are no-ops
+ * without one.
+ */
+async function syncToolResult(
+  action: string,
+  client: unknown,
+  roots: ReturnType<typeof getRoots>,
+): Promise<string> {
+  if (action === "status") {
+    const state = status({ roots });
+    return JSON.stringify(state, null, 2);
+  }
+
+  try {
+    const result = await runSync(client, action === "push" ? "push" : "pull");
+    const lines = [result.message];
+    if (result.files > 0) lines.push(`Files: ${result.files}`);
+    if (result.restartRequired && result.changed) {
+      lines.push("Restart OpenCode for the new configuration to take effect.");
+    }
+    return lines.join("\n");
+  } catch (error) {
+    return `Sync failed: ${(error as Error).message}`;
+  }
+}
+
 export const OpencodeGithubSync = async (ctx: PluginContext) => {
   const client = ctx?.client;
   const roots = getRoots();
@@ -245,10 +278,7 @@ export const OpencodeGithubSync = async (ctx: PluginContext) => {
 
     tool: {
       opencode_sync: {
-        description:
-          "Sync OpenCode configuration with the GitHub sync repository. " +
-          "Use action 'push' to upload this machine's configuration, 'pull' to apply the shared " +
-          "configuration, or 'status' to report what is out of sync.",
+        description: SYNC_TOOL_DESCRIPTION,
         args: {
           action: {
             type: "string",
@@ -257,28 +287,111 @@ export const OpencodeGithubSync = async (ctx: PluginContext) => {
           },
         },
         async execute(args: { action?: string }) {
-          const action = args?.action ?? "status";
-
-          if (action === "status") {
-            const state = status({ roots });
-            return JSON.stringify(state, null, 2);
-          }
-
-          try {
-            const result = await runSync(client, action === "push" ? "push" : "pull");
-            const lines = [result.message];
-            if (result.files > 0) lines.push(`Files: ${result.files}`);
-            if (result.restartRequired && result.changed) {
-              lines.push("Restart OpenCode for the new configuration to take effect.");
-            }
-            return lines.join("\n");
-          } catch (error) {
-            return `Sync failed: ${(error as Error).message}`;
-          }
+          return syncToolResult(args?.action ?? "status", client, roots);
         },
       },
     },
   };
 };
 
-export default OpencodeGithubSync;
+/** Structural types for the V2 setup context. Declared locally on purpose so
+ * the package never depends on @opencode/plugin at runtime. */
+interface PluginV2ToolEditor {
+  add(tool: {
+    name: string;
+    options?: { codemode?: boolean };
+    description: string;
+    input: Record<string, unknown>;
+    execute(input: { action?: string }): Promise<{ content: string }>;
+  }): void;
+}
+
+interface PluginV2Context {
+  tool: { transform(fn: (editor: PluginV2ToolEditor) => void | Promise<void>): Promise<unknown> };
+  event: { subscribe(options: { signal: AbortSignal }): AsyncIterable<{ type?: string }> };
+}
+
+/**
+ * Dual-generation entrypoint (OpenCode V1 and V2).
+ *
+ * V1 hosts (1.18.29+) call `server()` and get the legacy hooks/tools exactly as
+ * before. V2 hosts call `setup()` and register the same behavior through the V2
+ * context: pull on startup, push on idle, the `opencode_sync` tool, and cleanup.
+ *
+ * V2 status: partial. Progress toasts still live on the V1 path; port them with
+ * the V2 TUI/RPC API before relying on this plugin under OpenCode 2.
+ */
+export default {
+  id: "opencode-github-sync",
+
+  async setup(ctx: PluginV2Context) {
+    const roots = getRoots();
+
+    if (!isConfigured()) {
+      console.log(
+        "opencode-github-sync is installed but no repository is configured. Run `opencode-sync init`.",
+      );
+      return;
+    }
+
+    const settings = loadSettings(roots.config);
+    const report = (level: string, message: string) => {
+      const line = `[opencode-github-sync] ${message}`;
+      if (level === "error") console.error(line);
+      else console.log(line);
+    };
+    report("info", "plugin loaded");
+
+    if (settings.autoPullOnStartup) {
+      // Deliberately not awaited, same as the V1 path.
+      void runSync(undefined, "pull").catch(() => {});
+    }
+
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "opencode_sync",
+        options: { codemode: false },
+        description: SYNC_TOOL_DESCRIPTION,
+        input: {
+          type: "object",
+          properties: {
+            action: {
+              type: "string",
+              enum: ["push", "pull", "status"],
+              description: "Which sync operation to run.",
+            },
+          },
+          required: ["action"],
+          additionalProperties: false,
+        },
+        async execute(input) {
+          const action = input?.action ?? "status";
+          return { content: await syncToolResult(action, undefined, getRoots()) };
+        },
+      });
+    });
+
+    const controller = new AbortController();
+    const task = (async () => {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        if (controller.signal.aborted) break;
+        if (event?.type === "session.idle" && settings.autoPushOnIdle) {
+          void runSync(undefined, "push").catch(() => {});
+        }
+      }
+    })().catch((error) => {
+      if (!controller.signal.aborted) {
+        report("error", `event subscription failed: ${(error as Error).message}`);
+      }
+    });
+
+    return async () => {
+      controller.abort();
+      await task;
+    };
+  },
+
+  async server(ctx: PluginContext) {
+    return OpencodeGithubSync(ctx);
+  },
+};
