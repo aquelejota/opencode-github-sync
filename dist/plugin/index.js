@@ -30,6 +30,8 @@ import { formatDuration, phaseLabel, } from "./progress.js";
 const ANNOUNCE_AFTER_MS = 3_000;
 /** Refresh the toast while a phase runs long, so it never looks frozen. */
 const HEARTBEAT_MS = 15_000;
+/** V2: debounce machine-wide pushes after a completed turn. */
+const V2_PUSH_DEBOUNCE_MS = 10_000;
 const WORKER_FILE = new URL("./worker.js", import.meta.url);
 async function toast(client, message, variant) {
     try {
@@ -287,9 +289,17 @@ export default {
                 console.log(line);
         };
         report("info", "plugin loaded");
-        if (settings.autoPullOnStartup) {
-            // Deliberately not awaited, same as the V1 path.
-            void runSync(undefined, "pull").catch(() => { });
+        // V2 instantiates plugins once per location and every instance receives the
+        // whole event broadcast; machine-wide work must run once per process.
+        const globalScope = globalThis;
+        const machine = globalScope.__opencodeGithubSyncV2 ?? { pulled: false, pushTimer: undefined };
+        globalScope.__opencodeGithubSyncV2 = machine;
+        if (!machine.pulled) {
+            machine.pulled = true;
+            if (settings.autoPullOnStartup) {
+                // Deliberately not awaited, same as the V1 path.
+                void runSync(undefined, "pull").catch(() => { });
+            }
         }
         await tool.transform((editor) => {
             editor.add({
@@ -319,8 +329,17 @@ export default {
             for await (const ev of event.subscribe({ signal: controller.signal })) {
                 if (controller.signal.aborted)
                     break;
-                if (ev?.type === "session.idle" && settings.autoPushOnIdle) {
-                    void runSync(undefined, "push").catch(() => { });
+                // V2 has no `session.idle`; a successful turn ends with
+                // `session.execution.succeeded`. Debounce machine-wide so a burst of
+                // events (or several location instances) still produces one push.
+                if (ev?.type === "session.execution.succeeded" && settings.autoPushOnIdle) {
+                    if (machine.pushTimer)
+                        clearTimeout(machine.pushTimer);
+                    machine.pushTimer = setTimeout(() => {
+                        machine.pushTimer = undefined;
+                        void runSync(undefined, "push").catch(() => { });
+                    }, V2_PUSH_DEBOUNCE_MS);
+                    machine.pushTimer.unref?.();
                 }
             }
         })().catch((error) => {

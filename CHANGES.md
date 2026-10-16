@@ -80,6 +80,14 @@ Base: **opencode-github-sync 3.0.1** (MIT) by [@doomsday616](https://github.com/
 
 **Remark.** The first V2 push rewrites every shard once (format change), then incremental again.
 
+## 8. V2 runtime: real event shapes and per-location instances (2026-10-16)
+
+**Problem.** V2 hosts instantiate plugins once per location and deliver every event to every instance, with a different envelope than V1: payloads live under `event.data` (not `event.properties`) and there is no `session.idle` — a successful turn ends with `session.execution.succeeded`. Ported plugins that kept the V1 shapes failed silently: the continuity prompt never fired and the idle auto-push never ran.
+
+**Fix.** The V2 setup path was rewritten against the observed contract. The plugin listens for `session.execution.succeeded` with a machine-wide 10 s debounce, and its startup pull plus event subscription are guarded to run once per process.
+
+**Evidence (production, 2026-10-16).** The idle auto-push produced `sync: 2026-10-16 15:24:33 from ryzendeb` right after a run, using the new event.
+
 ## Migration notes
 
 - The first export after switching rewrites every shard once, because the stable `exportedAt` value differs from the old wall-clock one. One large commit, then incremental.
