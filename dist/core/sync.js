@@ -367,7 +367,10 @@ async function maybeImportSessions(ctx) {
     }
     if (result.imported > 0)
         ctx.reporter.detail(`Imported ${result.imported} session(s)`);
-    return { imported: result.imported, skipped: result.skippedOlder };
+    if (result.skippedV2Only > 0) {
+        ctx.reporter.warn(`Skipped ${result.skippedV2Only} OpenCode 2 session shard(s) — this database has no session_v2 table yet.`);
+    }
+    return { imported: result.imported, skipped: result.skippedOlder + result.skippedV2Only };
 }
 export function status(options = {}) {
     const roots = options.roots ?? getRoots();

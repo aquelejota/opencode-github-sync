@@ -463,6 +463,208 @@ describe("export and import", () => {
   });
 });
 
+describe("V2 schema", () => {
+  const V2_SCHEMA = `
+CREATE TABLE session_v2 (
+  id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, slug TEXT NOT NULL,
+  directory TEXT NOT NULL, title TEXT NOT NULL, version TEXT NOT NULL,
+  time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, workspace_id TEXT,
+  FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
+);
+CREATE TABLE session_message (
+  id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL,
+  time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+);
+`;
+
+  async function makeV2Database(file: string, now: number): Promise<void> {
+    const db = await openDatabase(file);
+    db.exec(SCHEMA + V2_SCHEMA);
+    db.prepare(
+      "INSERT INTO project (id, worktree, name, time_created, time_updated, sandboxes) VALUES (?,?,?,?,?,?)",
+    ).run("prj_1", "/work/app", "app", now, now, "[]");
+
+    const insertV1 = (id: string, updated: number): void => {
+      db.prepare(
+        `INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+         VALUES (?,?,?,?,?,?,?,?)`,
+      ).run(id, "prj_1", id, "/work/app", `title ${id}`, "1.0.0", updated - DAY, updated);
+      db.prepare(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?)",
+      ).run(`msg_${id}`, id, updated, updated, JSON.stringify({ role: "user" }));
+      db.prepare(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?,?)",
+      ).run(`prt_${id}`, `msg_${id}`, id, updated, updated, JSON.stringify({ text: "legacy" }));
+    };
+    const insertV2 = (id: string, updated: number): void => {
+      db.prepare(
+        `INSERT INTO session_v2 (id, project_id, slug, directory, title, version, time_created, time_updated)
+         VALUES (?,?,?,?,?,?,?,?)`,
+      ).run(id, "prj_1", id, "/work/app", `title ${id}`, "2.0.0", updated - DAY, updated);
+      db.prepare(
+        `INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+         VALUES (?,?,?,?,?,?,?)`,
+      ).run(`smsg_${id}`, id, "user", 1, updated, updated, JSON.stringify({ text: "v2 body" }));
+      db.prepare(
+        `INSERT INTO todo (session_id, content, status, priority, position, time_created, time_updated)
+         VALUES (?,?,?,?,?,?,?)`,
+      ).run(id, "v2 thing", "pending", "high", 0, updated, updated);
+    };
+
+    // Migrated conversation: complete rows in both families.
+    insertV1("ses_migrated", now - DAY);
+    insertV2("ses_migrated", now - DAY);
+    // Session created natively on V2: only the V2 family has it.
+    insertV2("ses_native", now - 2 * DAY);
+
+    db.close();
+  }
+
+  const readShardJson = (id: string): any =>
+    JSON.parse(
+      gunzipSync(fs.readFileSync(path.join(root, "_sessions", `${id}.json.gz`))).toString(),
+    );
+
+  it("exports V2 sessions once — session_v2 rows plus session_message — without the legacy tables", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const file = path.join(root, "db.sqlite");
+    await makeV2Database(file, now);
+
+    const result = await exportSessions(file, root, { ...settings(), now }, silentReporter);
+    expect(result.written.sort()).toEqual(["ses_migrated", "ses_native"]);
+
+    const migrated = readShardJson("ses_migrated");
+    expect(migrated.generation).toBe("v2");
+    expect(migrated.session.version).toBe("2.0.0");
+    expect(migrated.tables.session_message).toHaveLength(1);
+    expect(migrated.tables.todo).toHaveLength(1);
+    expect(migrated.tables.message).toBeUndefined();
+    expect(migrated.tables.part).toBeUndefined();
+
+    const native = readShardJson("ses_native");
+    expect(native.generation).toBe("v2");
+    expect(native.session.title).toBe("title ses_native");
+    expect(native.tables.session_message).toHaveLength(1);
+  });
+
+  it("never downgrades a shard already written with generation v2", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const file = path.join(root, "v1.sqlite");
+    await makeDatabase(file, now);
+
+    const shardFile = path.join(root, "_sessions", "ses_recent.json.gz");
+    fs.mkdirSync(path.dirname(shardFile), { recursive: true });
+    const planted = {
+      formatVersion: 1,
+      generation: "v2",
+      session: { id: "ses_recent", time_updated: now - DAY },
+      tables: { session_message: [] },
+      exportedAt: now - DAY,
+    };
+    fs.writeFileSync(shardFile, gzipSync(Buffer.from(JSON.stringify(planted))));
+
+    const result = await exportSessions(file, root, { ...settings(), now }, silentReporter);
+    expect(result.unchanged).toContain("ses_recent");
+    expect(result.written).not.toContain("ses_recent");
+    expect(readShardJson("ses_recent").generation).toBe("v2");
+  });
+
+  it("skips V2 shards whole when the local database has no session_v2", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const source = path.join(root, "v2.sqlite");
+    await makeV2Database(source, now);
+    await exportSessions(source, root, { ...settings(), now }, silentReporter);
+
+    const target = path.join(root, "v1.sqlite");
+    const db = await openDatabase(target);
+    db.exec(SCHEMA);
+    db.close();
+
+    const result = await importSessions(target, root, silentReporter);
+    expect(result.skippedV2Only).toBe(2);
+    expect(result.imported).toBe(0);
+
+    const check = await openDatabase(target, { readOnly: true });
+    const count = check.prepare("SELECT COUNT(*) AS n FROM session").all() as any[];
+    expect(Number(count[0].n)).toBe(0);
+    check.close();
+  });
+
+  it("round-trips V2 sessions into an empty V2 database", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const source = path.join(root, "v2.sqlite");
+    await makeV2Database(source, now);
+    await exportSessions(source, root, { ...settings(), now }, silentReporter);
+
+    const target = path.join(root, "v2-target.sqlite");
+    const db = await openDatabase(target);
+    db.exec(SCHEMA + V2_SCHEMA);
+    db.close();
+
+    const result = await importSessions(target, root, silentReporter);
+    expect(result.imported).toBe(2);
+    expect(result.skippedV2Only).toBe(0);
+
+    const check = await openDatabase(target, { readOnly: true });
+    const session = check
+      .prepare("SELECT title FROM session_v2 WHERE id = ?")
+      .all("ses_native") as any[];
+    expect(session[0]?.title).toBe("title ses_native");
+    const messages = check
+      .prepare("SELECT COUNT(*) AS n FROM session_message WHERE session_id = ?")
+      .all("ses_native") as any[];
+    expect(Number(messages[0].n)).toBe(1);
+    const legacy = check
+      .prepare("SELECT COUNT(*) AS n FROM session WHERE id = ?")
+      .all("ses_native") as any[];
+    expect(Number(legacy[0].n)).toBe(0);
+    check.close();
+  });
+
+  it("keeps last-writer-wins per generation (V2 shard vs session_v2 time)", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const source = path.join(root, "v2.sqlite");
+    await makeV2Database(source, now);
+    await exportSessions(source, root, { ...settings(), now }, silentReporter);
+
+    const target = path.join(root, "v2-target.sqlite");
+    const db = await openDatabase(target);
+    db.exec(SCHEMA + V2_SCHEMA);
+    db.prepare(
+      "INSERT INTO project (id, worktree, name, time_created, time_updated, sandboxes) VALUES (?,?,?,?,?,?)",
+    ).run("prj_1", "/work/app", "app", now, now, "[]");
+    db.prepare(
+      `INSERT INTO session_v2 (id, project_id, slug, directory, title, version, time_created, time_updated)
+       VALUES (?,?,?,?,?,?,?,?)`,
+    ).run(
+      "ses_native",
+      "prj_1",
+      "ses_native",
+      "/work/app",
+      "local newer",
+      "2.0.0",
+      now,
+      now + 10 * DAY,
+    );
+    db.close();
+
+    const result = await importSessions(target, root, silentReporter);
+    expect(result.skippedOlder).toBe(1);
+
+    const check = await openDatabase(target, { readOnly: true });
+    const rows = check
+      .prepare("SELECT title FROM session_v2 WHERE id = ?")
+      .all("ses_native") as any[];
+    expect(rows[0]?.title).toBe("local newer");
+    check.close();
+  });
+});
+
 describe("sanitizeId", () => {
   it("keeps safe ids untouched", () => {
     expect(sanitizeId("ses_065cad1caffeN3lf1RgLZno30")).toBe("ses_065cad1caffeN3lf1RgLZno30");

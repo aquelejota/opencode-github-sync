@@ -30,9 +30,16 @@ import { existingTables, openDatabase, tableColumns } from "./sqlite.js";
  * Import is an upsert inside a transaction, so a failure leaves the local
  * database exactly as it was.
  */
-/** Tables whose rows belong to exactly one session. */
-const SESSION_TABLES = [
-    "session_message",
+/**
+ * Tables whose rows belong to exactly one session, per schema generation.
+ *
+ * An OpenCode 2 database keeps the legacy V1 tables (`session`, `message`,
+ * `part`) next to its own (`session_v2`, `session_message`), and every migrated
+ * conversation is stored in both. Exporting both families in one shard doubled
+ * the payload (~608 MB across the repo on 2026-10-16) and broke the push, so an
+ * export ships exactly one family — the one its database actually uses.
+ */
+const V1_SESSION_TABLES = [
     "message",
     "part",
     "todo",
@@ -40,6 +47,19 @@ const SESSION_TABLES = [
     "session_context_epoch",
     "session_input",
 ];
+const V2_SESSION_TABLES = [
+    "session_message",
+    "todo",
+    "session_share",
+    "session_context_epoch",
+    "session_input",
+];
+const V1_SESSION_TABLE = "session";
+const V2_SESSION_TABLE = "session_v2";
+/** Session rows live in `session_v2` once the database has the V2 schema. */
+function sessionTableFor(db) {
+    return existingTables(db, [V2_SESSION_TABLE]).length > 0 ? V2_SESSION_TABLE : V1_SESSION_TABLE;
+}
 function shardPath(repoRoot, sessionId) {
     return path.join(repoRoot, SESSIONS_DIR, `${sanitizeId(sessionId)}.json.gz`);
 }
@@ -88,8 +108,9 @@ function canonicalRowKey(row) {
 export function selectSessions(db, options) {
     const now = options.now ?? Date.now();
     const cutoff = now - options.days * 24 * 60 * 60 * 1000;
+    const table = sessionTableFor(db);
     const rows = readRows(db, `SELECT id, title, directory, time_updated, time_created, project_id
-       FROM session
+       FROM "${table}"
       ORDER BY time_updated DESC`, []);
     const exclude = new Set(options.exclude);
     const include = new Set(options.include);
@@ -129,8 +150,8 @@ export function selectSessions(db, options) {
     }
     return selected;
 }
-function buildShard(db, sessionId, tables) {
-    const sessionRow = readRows(db, "SELECT * FROM session WHERE id = ?", [sessionId])[0];
+function buildShard(db, sessionId, tables, sessionTable) {
+    const sessionRow = readRows(db, `SELECT * FROM "${sessionTable}" WHERE id = ?`, [sessionId])[0];
     if (!sessionRow)
         throw new Error(`Session ${sessionId} disappeared while exporting`);
     const shard = {
@@ -142,6 +163,8 @@ function buildShard(db, sessionId, tables) {
         // push rewrites every shard and import/pull churn is unavoidable.
         exportedAt: Number(sessionRow.time_updated ?? 0),
     };
+    if (sessionTable === V2_SESSION_TABLE)
+        shard.generation = "v2";
     const projectId = sessionRow.project_id;
     // `global` is OpenCode's synthetic project row and its worktree/vcs metadata
     // is machine-specific. Shipping it would overwrite the receiving machine's
@@ -167,17 +190,28 @@ export async function exportSessions(databaseFile, repoRoot, options, reporter) 
         return result;
     const db = await openDatabase(databaseFile, { readOnly: true });
     try {
-        const tables = existingTables(db, [...SESSION_TABLES]).filter((table) => tableColumns(db, table).includes("session_id"));
+        const sessionTable = sessionTableFor(db);
+        const v2 = sessionTable === V2_SESSION_TABLE;
+        const tables = existingTables(db, [...(v2 ? V2_SESSION_TABLES : V1_SESSION_TABLES)]).filter((table) => tableColumns(db, table).includes("session_id"));
         const sessions = selectSessions(db, options);
         result.considered = sessions.length;
         const outDir = path.join(repoRoot, SESSIONS_DIR);
         ensureDir(outDir);
         const keep = new Set();
         for (const session of sessions) {
-            const shard = buildShard(db, session.id, tables);
+            const shard = buildShard(db, session.id, tables, sessionTable);
             const json = Buffer.from(JSON.stringify(shard));
             const file = shardPath(repoRoot, session.id);
-            if (fs.existsSync(file) && shardContentEquals(file, json)) {
+            const existing = fs.existsSync(file) ? readShardInfo(file) : undefined;
+            // Never downgrade: a V1 machine re-exporting a session a V2 machine
+            // already wrote would rewrite the shard forever (each side sees the
+            // other's bytes as different) and strip the V2 data it carries.
+            if (existing?.generation === "v2" && !v2) {
+                keep.add(path.basename(file));
+                result.unchanged.push(session.id);
+                continue;
+            }
+            if (existing && shardContentEquals(existing.json, json)) {
                 keep.add(path.basename(file));
                 result.unchanged.push(session.id);
                 continue;
@@ -234,14 +268,7 @@ function pruneShards(outDir, keep, options, reporter) {
  * whole-repository diff. The fast path compares the uncompressed bytes; when
  * those differ, a deep compare still rules out a mere key-order difference.
  */
-function shardContentEquals(file, json) {
-    let existing;
-    try {
-        existing = gunzipSync(fs.readFileSync(file));
-    }
-    catch {
-        return false;
-    }
+function shardContentEquals(existing, json) {
     if (existing.equals(json))
         return true;
     try {
@@ -249,6 +276,20 @@ function shardContentEquals(file, json) {
     }
     catch {
         return false;
+    }
+}
+/** Uncompressed bytes plus the generation marker of an on-disk shard. */
+function readShardInfo(file) {
+    try {
+        const json = gunzipSync(fs.readFileSync(file));
+        const parsed = JSON.parse(json.toString("utf8"));
+        return {
+            json,
+            generation: typeof parsed?.generation === "string" ? parsed.generation : undefined,
+        };
+    }
+    catch {
+        return undefined;
     }
 }
 function readShard(file) {
@@ -285,9 +326,15 @@ function normalize(value) {
     }
     return value;
 }
-/** Import every shard from `<repo>/_sessions` into the local database. */
+/**
+ * Import every shard from `<repo>/_sessions` into the local database.
+ *
+ * Shards written by an OpenCode 2 machine (`generation: "v2"`) land in the V2
+ * tables and are skipped whole when the local database is still V1. Shards
+ * without the marker keep the original V1 behavior.
+ */
 export async function importSessions(databaseFile, repoRoot, reporter) {
-    const result = { imported: 0, skippedOlder: 0, failed: [] };
+    const result = { imported: 0, skippedOlder: 0, skippedV2Only: 0, failed: [] };
     const shardDir = path.join(repoRoot, SESSIONS_DIR);
     if (!fs.existsSync(shardDir))
         return result;
@@ -309,8 +356,13 @@ export async function importSessions(databaseFile, repoRoot, reporter) {
             }
             return set;
         };
+        const localSessionTable = sessionTableFor(db);
+        // Last-writer-wins is evaluated per generation: a V2 shard is compared
+        // against `session_v2`, a legacy shard against `session`. V2 shards are
+        // skipped whole on a V1 database — a legacy reader must never store a
+        // session row whose messages it cannot import.
         const localTimes = new Map();
-        for (const row of readRows(db, "SELECT id, time_updated FROM session", [])) {
+        for (const row of readRows(db, `SELECT id, time_updated FROM "${localSessionTable}"`, [])) {
             localTimes.set(String(row.id), Number(row.time_updated ?? 0));
         }
         for (const file of files) {
@@ -319,6 +371,11 @@ export async function importSessions(databaseFile, repoRoot, reporter) {
                 const shard = readShard(full);
                 const sessionId = String(shard.session.id);
                 const incoming = Number(shard.session.time_updated ?? 0);
+                const shardV2 = shard.generation === "v2";
+                if (shardV2 && localSessionTable !== V2_SESSION_TABLE) {
+                    result.skippedV2Only++;
+                    continue;
+                }
                 const local = localTimes.get(sessionId);
                 // Last-writer-wins at session granularity. A session that is newer
                 // locally is left completely alone, so an in-progress conversation is
@@ -333,7 +390,8 @@ export async function importSessions(databaseFile, repoRoot, reporter) {
                         upsert(db, "project", shard.project, columns("project"));
                     if (shard.workspace)
                         upsert(db, "workspace", shard.workspace, columns("workspace"));
-                    upsert(db, "session", shard.session, columns("session"));
+                    const sessionTable = shardV2 ? V2_SESSION_TABLE : V1_SESSION_TABLE;
+                    upsert(db, sessionTable, shard.session, columns(sessionTable));
                     for (const [table, rows] of Object.entries(shard.tables)) {
                         if (rows.length === 0)
                             continue;
@@ -373,8 +431,9 @@ export async function listSessions(databaseFile, limit) {
         return [];
     const db = await openDatabase(databaseFile, { readOnly: true });
     try {
+        const table = sessionTableFor(db);
         const rows = readRows(db, `SELECT id, title, directory, time_updated, time_created, project_id
-         FROM session ORDER BY time_updated DESC LIMIT ?`, [limit]);
+         FROM "${table}" ORDER BY time_updated DESC LIMIT ?`, [limit]);
         return rows.map((row) => ({
             id: String(row.id),
             title: String(row.title ?? ""),

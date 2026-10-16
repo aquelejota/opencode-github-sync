@@ -21,6 +21,13 @@ export interface SessionShard {
     workspace?: Record<string, unknown>;
     tables: Record<string, Record<string, unknown>[]>;
     exportedAt: number;
+    /**
+     * Present only on shards produced from an OpenCode 2 database. The field is
+     * additive, so V1 readers that predate it simply ignore it; readers that know
+     * it use it to route the session row (`session` vs `session_v2`), to refuse
+     * V2-only shards on a V1 database, and to never downgrade a V2 shard.
+     */
+    generation?: "v2";
 }
 export interface SelectOptions extends SessionSettings {
     now?: number;
@@ -40,6 +47,8 @@ export interface ExportResult {
 export interface ImportResult {
     imported: number;
     skippedOlder: number;
+    /** V2 shards skipped whole because the local database has no `session_v2`. */
+    skippedV2Only: number;
     failed: {
         file: string;
         reason: string;
@@ -57,7 +66,13 @@ export declare function sanitizeId(id: string): string;
 export declare function selectSessions(db: SqliteDatabase, options: SelectOptions): SessionRecord[];
 /** Export the selected sessions into `<repo>/_sessions`. */
 export declare function exportSessions(databaseFile: string, repoRoot: string, options: SelectOptions, reporter: Reporter): Promise<ExportResult>;
-/** Import every shard from `<repo>/_sessions` into the local database. */
+/**
+ * Import every shard from `<repo>/_sessions` into the local database.
+ *
+ * Shards written by an OpenCode 2 machine (`generation: "v2"`) land in the V2
+ * tables and are skipped whole when the local database is still V1. Shards
+ * without the marker keep the original V1 behavior.
+ */
 export declare function importSessions(databaseFile: string, repoRoot: string, reporter: Reporter): Promise<ImportResult>;
 /** List sessions available locally, newest first — powers `sessions list`. */
 export declare function listSessions(databaseFile: string, limit: number): Promise<SessionRecord[]>;

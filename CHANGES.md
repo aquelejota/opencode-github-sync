@@ -68,6 +68,18 @@ Base: **opencode-github-sync 3.0.1** (MIT) by [@doomsday616](https://github.com/
 
 **Evidence (row order, production, 2026-09-23).** Before fix 4 the two machines ping-ponged the same 75 shards: ryzendeb 11:55 (75), thinkdeb 12:14 (77, same 75), ryzendeb 12:27 (76, same 75) — byte sizes reverting exactly while the only difference was the array order of `part` rows. After deploying fix 4, the first push normalised 132 of 928 shards once (4 vendor files + 132 shards, 136 changes); the next push carried only the two live sessions' shards (2 changes).
 
+## 7. One schema family per shard (OpenCode 2, 2026-10-16)
+
+**Problem.** An OpenCode 2 database keeps the legacy V1 tables (`session`, `message`, `part`) next to its own (`session_v2`, `session_message`), and every migrated conversation is stored in both. The export table list included both families, so each shard held the same messages twice: re-exporting the 1105 shards produced ~608 MB of payload and the push died on the Forgejo proxy (HTTP 504, repeatedly).
+
+**Fix.** An export now ships exactly one family, chosen by the local schema: `session_v2` + `session_message` when the database has the V2 tables, `session` + `message` + `part` otherwise. Shards written from a V2 database carry `generation: "v2"` (additive field — older V1 readers ignore it). The import routes the session row by generation, skips V2 shards whole on a V1 database (`skippedV2Only`), and the export refuses to downgrade a shard that is already `generation: "v2"` — a V1 machine coming back online cannot rewrite V2 shards forever or strip their data.
+
+**Tests.** `tests/sessions.test.ts`: "exports V2 sessions once — session_v2 rows plus session_message — without the legacy tables", "never downgrades a shard already written with generation v2", "skips V2 shards whole when the local database has no session_v2", "round-trips V2 sessions into an empty V2 database", "keeps last-writer-wins per generation (V2 shard vs session_v2 time)".
+
+**Evidence (production, 2026-10-16).** Full export of the live 1116-session database: 1113 shards in 19.6 s, 309 MB — against 611 MB with both families. Three sessions exceed the 20 MB shard cap and stay local.
+
+**Remark.** The first V2 push rewrites every shard once (format change), then incremental again.
+
 ## Migration notes
 
 - The first export after switching rewrites every shard once, because the stable `exportedAt` value differs from the old wall-clock one. One large commit, then incremental.
