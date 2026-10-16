@@ -265,6 +265,14 @@ export const OpencodeGithubSync = async (ctx) => {
 export default {
     id: "opencode-github-sync",
     async setup(ctx) {
+        // OpenCode 1.19.x (transition hosts) also invokes setup() but hands it a
+        // partial context without the tool/event domains, and its failures are
+        // swallowed. Only proceed on a real V2 context.
+        const tool = ctx?.tool;
+        const event = ctx?.event;
+        if (typeof tool?.transform !== "function" || typeof event?.subscribe !== "function") {
+            return;
+        }
         const roots = getRoots();
         if (!isConfigured()) {
             console.log("opencode-github-sync is installed but no repository is configured. Run `opencode-sync init`.");
@@ -283,7 +291,7 @@ export default {
             // Deliberately not awaited, same as the V1 path.
             void runSync(undefined, "pull").catch(() => { });
         }
-        await ctx.tool.transform((editor) => {
+        await tool.transform((editor) => {
             editor.add({
                 name: "opencode_sync",
                 options: { codemode: false },
@@ -308,10 +316,10 @@ export default {
         });
         const controller = new AbortController();
         const task = (async () => {
-            for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+            for await (const ev of event.subscribe({ signal: controller.signal })) {
                 if (controller.signal.aborted)
                     break;
-                if (event?.type === "session.idle" && settings.autoPushOnIdle) {
+                if (ev?.type === "session.idle" && settings.autoPushOnIdle) {
                     void runSync(undefined, "push").catch(() => { });
                 }
             }

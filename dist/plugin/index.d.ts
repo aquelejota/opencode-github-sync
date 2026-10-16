@@ -45,10 +45,10 @@ interface PluginV2ToolEditor {
     }): void;
 }
 interface PluginV2Context {
-    tool: {
+    tool?: {
         transform(fn: (editor: PluginV2ToolEditor) => void | Promise<void>): Promise<unknown>;
     };
-    event: {
+    event?: {
         subscribe(options: {
             signal: AbortSignal;
         }): AsyncIterable<{
