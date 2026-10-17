@@ -40,6 +40,10 @@ ${DATA_DIR}/storage/session_diff
 # Machine-local UI state
 ${STATE_DIR}/session.json
 
+# Machine-local secrets — never commit (OpenCode 2 writes the background
+# service password here; one per machine, no reason to travel)
+service.json
+
 # Empty directories recreated by OpenCode at runtime
 plugin/
 

@@ -116,6 +116,10 @@ npm run build
 
 The test suite now genuinely exercises SQLite-backed session tests (including regression tests for the two upstream session bugs). Negative controls were checked: reverting each fix makes the corresponding test fail.
 
+## Roadmap
+
+Open items we want to agree on before writing code live in [ROADMAP.md](./ROADMAP.md) — currently: session tombstones so deletions travel between machines (today a deleted session comes back from the other machine's next export).
+
 ## Credits & license
 
 - Based on [opencode-github-sync](https://github.com/doomsday616/opencode-github-sync) by [@doomsday616](https://github.com/doomsday616) — MIT, see [LICENSE](./LICENSE).

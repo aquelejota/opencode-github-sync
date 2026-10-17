@@ -98,6 +98,16 @@ Base: **opencode-github-sync 3.0.1** (MIT) by [@doomsday616](https://github.com/
 
 **Deploy note.** The service does not hot-reload plugins the way the TUI does: after updating the vendored `dist`, restart the service so the new code loads.
 
+## 10. Machine-local secrets stay out of the repository (2026-10-17)
+
+**Problem.** OpenCode 2 writes the background-service password to `service.json` **inside the config directory** — which is the sync worktree. `writeRepoMetadata()` regenerates `.gitignore` from `DEFAULT_GITIGNORE` on every sync, so the file was never listed there; `stageIn()` runs `git add -A`, so the password was committed and pushed on the next auto-push (first seen in the ryzendeb push of 2026-10-16 15:24). A hand edit to `.gitignore` is not a fix: the next sync rewrites the file from the constant, re-adds the secret and commits the revert — which is exactly what happened when it was fixed by hand on 2026-10-17 (15 s later, same machine).
+
+**Fix.** `service.json` joins `DEFAULT_GITIGNORE` under a "machine-local secrets" heading: the password is per machine and has no reason to travel. Untracking it (`git rm --cached`) is then durable, because no sync regenerates the entry away.
+
+**Test.** `tests/repo.test.ts` → "ignores the machine-local service password" and "writes both metadata files, even when they already exist" (a hand-edited `.gitignore` is rewritten to the constant). 119 green.
+
+**Note.** The file stays on disk; only its presence in the repository is removed. A password already pushed stays in that repository's history — rotate it by deleting the file and restarting the service, which mints a new one.
+
 ## Migration notes
 
 - The first export after switching rewrites every shard once, because the stable `exportedAt` value differs from the old wall-clock one. One large commit, then incremental.
