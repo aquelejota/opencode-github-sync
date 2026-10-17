@@ -108,6 +108,26 @@ Base: **opencode-github-sync 3.0.1** (MIT) by [@doomsday616](https://github.com/
 
 **Note.** The file stays on disk; only its presence in the repository is removed. A password already pushed stays in that repository's history — rotate it by deleting the file and restarting the service, which mints a new one.
 
+## 11. A V2 shard whose todos reference the legacy `session` table is no longer rolled back (2026-10-17)
+
+**Problem.** An OpenCode 2 database keeps the legacy tables (`session`, `message`, `part`) next to its own (`session_v2`, `session_message`, …), and `todo.session_id` / `session_share.session_id` still reference the **legacy** `session` table, not `session_v2`. A V2 shard ships `session_v2` + `session_message` + `todo`, so importing one into a database that has both families tried to insert `todo` rows for a session that existed only in `session_v2` — the foreign key failed, the transaction rolled back, and the **entire session** was lost. On the 2026-10-17 recovery of the machine that had been offline for three weeks, 45 of 1046 shards failed this way; every one of them carried `todo` rows.
+
+**Fix.** When a V2 shard carries rows for a table that still references the legacy `session` table, the import now also upserts the session row into legacy `session` (when that table exists). This is what OpenCode itself stores for a migrated conversation — it lives in both families — and the upsert is the same non-destructive `ON CONFLICT DO UPDATE`, so no cascade is triggered. A V2 shard without such tables still writes no legacy row.
+
+**Test.** The test schema declared no foreign key on `todo`, so no test could see this. `tests/sessions.test.ts` now declares the real ones (`todo.session_id → session.id`, `session_message.session_id → session_v2.id`), the fixture only gives todos to the conversation that has both families, and a new test ("imports a V2 shard's todos by mirroring the legacy session row") fails with `FOREIGN KEY constraint failed` when the mirror is removed. 120 green.
+
+**Evidence.** Reproduced against the real database with one failing shard: `project` OK, `session_v2` OK, `session_message` OK, `todo` → `FOREIGN KEY constraint failed`; with the legacy mirror inserted first, everything applies. After the fix the same 45 shards import cleanly.
+
+## 12. The vendored plugin build travels with the repository (2026-10-17)
+
+**Problem.** `DEFAULT_GITIGNORE` carried an unanchored `plugin/` ("empty directories recreated by OpenCode at runtime"). A gitignore pattern without a leading slash matches at any depth, so it also swallowed `vendor/opencode-github-sync/dist/plugin/` — the OpenCode 2 plugin entrypoint. The sync repository shipped `dist/core` and `dist/cli` but never `dist/plugin`, so a machine that pulled got a plugin whose `core` was current and whose `index.js` was an old hand-copied build. On the machine that had been offline for three weeks that stale entrypoint still exported a V1 function, and OpenCode 2 refused to load it (`Plugin must export a default definition with an id and an effect or setup function`) — no plugin, no sync, no error toast.
+
+**Fix.** The pattern is anchored: `/plugin/`. The vendored `dist/plugin` and `dist/tui.js` are now committed and travel like the rest of `vendor/`. Since the file is regenerated from the constant on every sync, the fix belongs in the constant, not in the file.
+
+**Test.** `tests/repo.test.ts` → "ignores the runtime plugin directory but not the vendored plugin build" runs `git check-ignore` against both paths on a freshly initialised repo. 121 green.
+
+**Note.** The plugin entrypoint is what the local bridge plugin re-exports (`plugins/sync-fork.js` → `vendor/.../dist/plugin/index.js`), so a stale copy silently disables sync on that machine; restarting the service does not fix it, because nothing pulls the file.
+
 ## Migration notes
 
 - The first export after switching rewrites every shard once, because the stable `exportedAt` value differs from the old wall-clock one. One large commit, then incremental.

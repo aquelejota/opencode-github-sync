@@ -63,6 +63,18 @@ const V2_SESSION_TABLES = [
 const V1_SESSION_TABLE = "session";
 const V2_SESSION_TABLE = "session_v2";
 
+/**
+ * Tables whose `session_id` still references the legacy `session` table even on
+ * an OpenCode 2 database (`todo`, `session_share`). They are exported with every
+ * shard, so a V2 shard that carries them needs a row in `session` too.
+ */
+const LEGACY_SESSION_REFERENCING_TABLES = ["todo", "session_share"] as const;
+
+/** Whether the shard carries rows for a table that references legacy `session`. */
+function referencesLegacySession(tables: Record<string, Record<string, unknown>[]>): boolean {
+  return LEGACY_SESSION_REFERENCING_TABLES.some((table) => (tables[table]?.length ?? 0) > 0);
+}
+
 /** Session rows live in `session_v2` once the database has the V2 schema. */
 function sessionTableFor(db: SqliteDatabase): string {
   return existingTables(db, [V2_SESSION_TABLE]).length > 0 ? V2_SESSION_TABLE : V1_SESSION_TABLE;
@@ -473,6 +485,7 @@ export async function importSessions(
     };
 
     const localSessionTable = sessionTableFor(db);
+    const hasLegacySessionTable = existingTables(db, [V1_SESSION_TABLE]).length > 0;
     // Last-writer-wins is evaluated per generation: a V2 shard is compared
     // against `session_v2`, a legacy shard against `session`. V2 shards are
     // skipped whole on a V1 database — a legacy reader must never store a
@@ -515,6 +528,14 @@ export async function importSessions(
           if (shard.workspace) upsert(db, "workspace", shard.workspace, columns("workspace"));
           const sessionTable = shardV2 ? V2_SESSION_TABLE : V1_SESSION_TABLE;
           upsert(db, sessionTable, shard.session, columns(sessionTable));
+          // An OpenCode 2 database keeps the legacy `session` table next to
+          // `session_v2`, and `todo`/`session_share` still point at the legacy
+          // one. A V2 shard carrying those rows is therefore rolled back whole
+          // by the foreign key unless the legacy row exists as well — which is
+          // also how OpenCode stores a migrated conversation (in both tables).
+          if (shardV2 && hasLegacySessionTable && referencesLegacySession(shard.tables)) {
+            upsert(db, V1_SESSION_TABLE, shard.session, columns(V1_SESSION_TABLE));
+          }
 
           for (const [table, rows] of Object.entries(shard.tables)) {
             if (rows.length === 0) continue;

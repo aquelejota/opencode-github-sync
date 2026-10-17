@@ -44,8 +44,11 @@ ${STATE_DIR}/session.json
 # service password here; one per machine, no reason to travel)
 service.json
 
-# Empty directories recreated by OpenCode at runtime
-plugin/
+# Empty directories recreated by OpenCode at runtime. Anchored on purpose: an
+# unanchored pattern with a bare trailing slash also matched
+# vendor/opencode-github-sync/dist/plugin/, so the OpenCode 2 plugin build was
+# silently kept out of the repository and every machine had to copy it in by hand.
+/plugin/
 
 # OS files
 .DS_Store

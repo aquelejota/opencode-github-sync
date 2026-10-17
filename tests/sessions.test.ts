@@ -42,7 +42,8 @@ CREATE TABLE todo (
   session_id TEXT NOT NULL, content TEXT NOT NULL, status TEXT NOT NULL,
   priority TEXT NOT NULL, position INTEGER NOT NULL,
   time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
-  PRIMARY KEY (session_id, position)
+  PRIMARY KEY (session_id, position),
+  FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE
 );
 CREATE TABLE event (
   id TEXT PRIMARY KEY, aggregate_id TEXT NOT NULL, seq INTEGER NOT NULL,
@@ -473,7 +474,8 @@ CREATE TABLE session_v2 (
 );
 CREATE TABLE session_message (
   id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL,
-  time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+  time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL,
+  FOREIGN KEY (session_id) REFERENCES session_v2(id) ON DELETE CASCADE
 );
 `;
 
@@ -496,7 +498,7 @@ CREATE TABLE session_message (
         "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?,?,?,?,?,?)",
       ).run(`prt_${id}`, `msg_${id}`, id, updated, updated, JSON.stringify({ text: "legacy" }));
     };
-    const insertV2 = (id: string, updated: number): void => {
+    const insertV2 = (id: string, updated: number, todos = 0): void => {
       db.prepare(
         `INSERT INTO session_v2 (id, project_id, slug, directory, title, version, time_created, time_updated)
          VALUES (?,?,?,?,?,?,?,?)`,
@@ -505,15 +507,19 @@ CREATE TABLE session_message (
         `INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
          VALUES (?,?,?,?,?,?,?)`,
       ).run(`smsg_${id}`, id, "user", 1, updated, updated, JSON.stringify({ text: "v2 body" }));
-      db.prepare(
-        `INSERT INTO todo (session_id, content, status, priority, position, time_created, time_updated)
-         VALUES (?,?,?,?,?,?,?)`,
-      ).run(id, "v2 thing", "pending", "high", 0, updated, updated);
+      // `todo.session_id` still references the legacy `session` table, so only a
+      // conversation that also has a legacy row can hold todos.
+      for (let position = 0; position < todos; position++) {
+        db.prepare(
+          `INSERT INTO todo (session_id, content, status, priority, position, time_created, time_updated)
+           VALUES (?,?,?,?,?,?,?)`,
+        ).run(id, "v2 thing", "pending", "high", position, updated, updated);
+      }
     };
 
     // Migrated conversation: complete rows in both families.
     insertV1("ses_migrated", now - DAY);
-    insertV2("ses_migrated", now - DAY);
+    insertV2("ses_migrated", now - DAY, 1);
     // Session created natively on V2: only the V2 family has it.
     insertV2("ses_native", now - 2 * DAY);
 
@@ -622,6 +628,44 @@ CREATE TABLE session_message (
       .prepare("SELECT COUNT(*) AS n FROM session WHERE id = ?")
       .all("ses_native") as any[];
     expect(Number(legacy[0].n)).toBe(0);
+    check.close();
+  });
+
+  it("imports a V2 shard's todos by mirroring the legacy session row (regression)", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const source = path.join(root, "v2.sqlite");
+    await makeV2Database(source, now);
+    await exportSessions(source, root, { ...settings(), now }, silentReporter);
+
+    // The shard really carries todo rows and they reference the legacy table,
+    // so importing it into a V2 database used to fail the foreign key and roll
+    // the whole session back (45 sessions lost on 2026-10-17).
+    expect(readShardJson("ses_migrated").tables.todo).toHaveLength(1);
+
+    const target = path.join(root, "v2-target.sqlite");
+    const db = await openDatabase(target);
+    db.exec(SCHEMA + V2_SCHEMA);
+    db.close();
+
+    const result = await importSessions(target, root, silentReporter);
+    expect(result.failed).toEqual([]);
+    expect(result.imported).toBe(2);
+
+    const check = await openDatabase(target, { readOnly: true });
+    const todos = check
+      .prepare("SELECT COUNT(*) AS n FROM todo WHERE session_id = ?")
+      .all("ses_migrated") as any[];
+    expect(Number(todos[0].n)).toBe(1);
+    const legacy = check
+      .prepare("SELECT COUNT(*) AS n FROM session WHERE id = ?")
+      .all("ses_migrated") as any[];
+    expect(Number(legacy[0].n)).toBe(1);
+    // A shard without legacy-referencing tables still writes no legacy row.
+    const native = check
+      .prepare("SELECT COUNT(*) AS n FROM session WHERE id = ?")
+      .all("ses_native") as any[];
+    expect(Number(native[0].n)).toBe(0);
     check.close();
   });
 
