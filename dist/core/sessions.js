@@ -233,7 +233,15 @@ function buildShard(db, sessionId, tables, sessionTable) {
     // is machine-specific. Shipping it would overwrite the receiving machine's
     // own row on import, and the next export would then see it as changed again.
     if (projectId && projectId !== "global") {
-        shard.project = readRows(db, "SELECT * FROM project WHERE id = ?", [projectId])[0];
+        const project = readRows(db, "SELECT * FROM project WHERE id = ?", [projectId])[0];
+        if (project) {
+            // `time_active` is activity bookkeeping: the app rewrites it constantly, so
+            // shipping it rewrote every shard of the project on every push (26 files per
+            // idle on a 26-session project). The other machine keeps its own value.
+            const stable = { ...project };
+            delete stable.time_active;
+            shard.project = stable;
+        }
     }
     const workspaceId = sessionRow.workspace_id;
     if (workspaceId) {

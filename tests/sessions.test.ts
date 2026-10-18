@@ -22,7 +22,8 @@ import { openDatabase, sqliteAvailable } from "../src/core/sqlite.js";
 const SCHEMA = `
 CREATE TABLE project (
   id TEXT PRIMARY KEY, worktree TEXT NOT NULL, name TEXT,
-  time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, sandboxes TEXT NOT NULL
+  time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, sandboxes TEXT NOT NULL,
+  time_active INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE session (
   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, slug TEXT NOT NULL,
@@ -81,8 +82,8 @@ async function makeDatabase(file: string, now: number): Promise<void> {
   db.exec(SCHEMA);
 
   db.prepare(
-    "INSERT INTO project (id, worktree, name, time_created, time_updated, sandboxes) VALUES (?,?,?,?,?,?)",
-  ).run("prj_1", "/work/app", "app", now, now, "[]");
+    "INSERT INTO project (id, worktree, name, time_created, time_updated, sandboxes, time_active) VALUES (?,?,?,?,?,?,?)",
+  ).run("prj_1", "/work/app", "app", now, now, "[]", now + 1000);
 
   const addSession = (id: string, title: string, directory: string, updated: number): void => {
     db.prepare(
@@ -918,5 +919,32 @@ describe("session tombstones × generations", () => {
     expect(result.tombstoned).toBe(0);
     expect(fs.existsSync(path.join(dir, "ses_v2only.json.gz"))).toBe(true);
     expect(fs.existsSync(path.join(dir, "_deleted", "ses_v2only.json"))).toBe(false);
+  });
+});
+
+describe("shard stability", () => {
+  it("does not ship the project's volatile time_active column", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const source = path.join(root, "db.sqlite");
+    const repo = path.join(root, "repo");
+    await makeDatabase(source, now);
+
+    await exportSessions(source, repo, { ...settings(), now }, silentReporter);
+    const file = path.join(repo, "_sessions", "ses_recent.json.gz");
+    const shard = JSON.parse(gunzipSync(fs.readFileSync(file)).toString()) as {
+      project?: Record<string, unknown>;
+    };
+    expect(shard.project).toBeTruthy();
+    expect("time_active" in (shard.project ?? {})).toBe(false);
+
+    // Only the activity clock changed: the shard must come out byte-identical.
+    const db = await openDatabase(source);
+    db.prepare("UPDATE project SET time_active = ? WHERE id = ?").run(now + 9000, "prj_1");
+    db.close();
+
+    const again = await exportSessions(source, repo, { ...settings(), now }, silentReporter);
+    expect(again.written).toEqual([]);
+    expect(again.unchanged).toContain("ses_recent");
   });
 });
