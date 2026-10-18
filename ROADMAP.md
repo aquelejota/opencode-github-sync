@@ -11,6 +11,16 @@ Numbered independently from `CHANGES.md` (which documents what is already done).
 **Raised:** 2026-10-17 (Ryzendeb, "fix restante" round: 79 sessions were deleted
 locally and would come back from the other machine on its next export).
 
+**Update 2026-10-18 — premise confirmed, and the urgency grew.** The 79 sessions
+did *not* come back only because the other machine deleted its rows *before* its
+first push; its export would otherwise have rewritten their shards, and its import
+has no `DELETE` (the pull's `reset --hard` removes the *file*, not the row). Measured
+on the real repository: `.git` is **7.2 GB** locally and the remote ~**10 GB** —
+12,562 objects arrived as a single 3.33 GB delta after three weeks of pushes,
+because every push rewrites whole shards and nothing is ever pruned. So R1 now has
+two halves: **tombstones for deletions** and **GC/compaction of the shard history**
+(the second needs both machines to agree on a rewrite of the remote and a re-sync).
+
 ### Problem
 
 `exportSessions()` prunes shards that no longer qualify (`pruneShards` removes the
