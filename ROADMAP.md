@@ -107,6 +107,11 @@ session reappears on the machine where it was deleted, some minutes later.
 **Status:** tooling done (2026-10-18) — see `CHANGES.md` item 14: the size nudge,
 `scripts/compact-sync-repo.sh` (squash) and the `/compact-sync` command. Executed on
 the real repository on 2026-10-18: `.git` went from **8.3 GB to ~0.4 GB**.
+**Nota (2026-10-18)**: o squash simples dá **HTTP 504** no Forgejo *neste* repositório
+gigante (o servidor engasga em qualquer atualização de ref não-fast-forward; um push
+mínimo passa, então não é payload). A saída foi **reconstruir** o repositório (arquivar
++ recriar com o mesmo nome, 13 commits em lotes); no repositório pequeno o 504 não
+apareceu — quando ele voltar a crescer, vale medir de novo antes de assumir a rota.
 Re-run it when the nudge says so (the two churn amplifiers were fixed in items 12/13,
 so growth is now a few hundred KB per push).
 

@@ -88,3 +88,21 @@ describe("splitProgressLines", () => {
     expect(splitProgressLines(raw)).toEqual([{ message: "hello", variant: "info" }]);
   });
 });
+
+describe("desktop notification flag", () => {
+  it("round-trips the notify flag the plugin uses for alerts", () => {
+    appendProgress(roots, "Sync repo at 1.6 GB — run /compact-sync", "warning", true);
+    const raw = fs.readFileSync(progressFilePath(roots), "utf8");
+    expect(JSON.parse(raw.trim()).notify).toBe(true);
+    expect(splitProgressLines(raw)).toEqual([
+      { message: "Sync repo at 1.6 GB — run /compact-sync", variant: "warning", notify: true },
+    ]);
+  });
+
+  it("leaves ordinary toasts without the flag", () => {
+    appendProgress(roots, "Sync: sent 12 file(s) in 3s", "success");
+    expect(splitProgressLines(fs.readFileSync(progressFilePath(roots), "utf8"))).toEqual([
+      { message: "Sync: sent 12 file(s) in 3s", variant: "success" },
+    ]);
+  });
+});

@@ -146,6 +146,14 @@ Base: **opencode-github-sync 3.0.1** (MIT) by [@doomsday616](https://github.com/
 
 **Tests.** 5 new cases in `tests/growth.test.ts`: quiet below the limit, speaking up past it, the weekly interval, disabled with a zero limit, and `repoBytes` against a real temporary repository. 133 green.
 
+## 15. Which build is loaded, and one command to deploy it (2026-10-18)
+
+**Problem.** The plugin runs from a vendored `dist/` inside the synced config directory, so two machines can run different builds of the same package version and nothing says so — on 2026-10-18 telling them apart took a hand-run `md5sum` of `dist/core/sessions.js`. Deploying was just as manual: `npm run build` then `cp -a dist/. <vendor>/dist/`, repeated by hand several times in one afternoon.
+
+**Fix.** `scripts/build-info.mjs` is the second half of `npm run build`: it writes `dist/build-info.json` (`version`, `commit`, `builtAt`), suffixing the commit with `+dirty` when the tree has uncommitted changes — precisely the case where a dist does not match its sha. `status()` now reports it as `build`, so `opencode_sync status` answers "which build is loaded?" in one line (the CLI renders a `build` row too). `scripts/update-vendor.sh` does build → mirror `dist/` into the vendored copy (`rsync -a --delete`) → print the build info and the restart reminder.
+
+**Tests.** 2 new cases in `tests/progress-file.test.ts` close the `notify` path that the growth alert (item 14) depends on: `appendProgress(..., true)` → JSONL → `splitProgressLines` round-trips the flag, and ordinary toasts stay without it. 135 green.
+
 ## Migration notes
 
 - The first export after switching rewrites every shard once, because the stable `exportedAt` value differs from the old wall-clock one. One large commit, then incremental.

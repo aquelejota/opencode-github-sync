@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { buildInfo } from "./build-info.js";
 import { git, isGitRepo, parseNameStatus, parsePorcelainPaths, toGitError, } from "./git.js";
 import { commitMessage, hostAlias } from "./host.js";
 import { applyOverrides, configMatchesRepo, findConfigFile } from "./overrides.js";
@@ -453,6 +454,7 @@ export function status(options = {}) {
         sessionShards: countShards(root),
         overridesActive: fs.existsSync(path.join(root, "opencode-sync.overrides.jsonc")),
         machineAlias: hostAlias(settings.machineAlias),
+        build: buildInfo(),
     };
     if (!remote || !isGitRepo(root))
         return base;

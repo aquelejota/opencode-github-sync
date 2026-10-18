@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { buildInfo } from "./build-info.js";
 import {
   type GitResult,
   git,
@@ -623,6 +624,8 @@ export interface StatusResult {
   sessionShards: number;
   overridesActive: boolean;
   machineAlias: string;
+  /** Which build answered this call (written at build time). */
+  build?: { version: string; commit: string; builtAt: string };
 }
 
 export function status(options: SyncOptions = {}): StatusResult {
@@ -644,6 +647,7 @@ export function status(options: SyncOptions = {}): StatusResult {
     sessionShards: countShards(root),
     overridesActive: fs.existsSync(path.join(root, "opencode-sync.overrides.jsonc")),
     machineAlias: hostAlias(settings.machineAlias),
+    build: buildInfo(),
   };
 
   if (!remote || !isGitRepo(root)) return base;

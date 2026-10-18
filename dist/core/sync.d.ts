@@ -51,6 +51,12 @@ export interface StatusResult {
     sessionShards: number;
     overridesActive: boolean;
     machineAlias: string;
+    /** Which build answered this call (written at build time). */
+    build?: {
+        version: string;
+        commit: string;
+        builtAt: string;
+    };
 }
 export declare function status(options?: SyncOptions): StatusResult;
 export declare function formatBytes(bytes: number): string;

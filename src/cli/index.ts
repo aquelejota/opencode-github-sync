@@ -190,6 +190,9 @@ function runStatus(): void {
       ? paint(`enabled · ${state.sessionShards} shard(s)`, style.text)
       : paint("disabled", style.muted),
   );
+  if (state.build) {
+    keyValue("build", `${state.build.version} ${state.build.commit}`);
+  }
 
   if (state.lastCommit) {
     heading("Last commit");
