@@ -1,4 +1,40 @@
-# Changelog
+
+## 3.1.0
+
+### Added
+- **Session tombstones.** Deleting a session now travels between machines. The
+  export writes `_sessions/_deleted/<id>.json` when a shard disappears because
+  the session left the database (never for the retention window); the import
+  deletes the local row (children first) and ignores that shard. Last-writer-wins
+  keeps a session that was resumed after the deletion, and a V1 database no
+  longer touches V2 shards it cannot read. (`CHANGES.md` item 13)
+- **Repository growth tooling.** A push past 1.5 GB warns — toast plus a desktop
+  notification, at most once a week — and names `scripts/compact-sync-repo.sh`
+  and the `/compact-sync` command, which squash the shard history behind guards
+  (clean tree, exactly in sync, `--yes`, auto-push paused). (item 14)
+- **Build identity and deployment.** `npm run build` writes
+  `dist/build-info.json` (version, commit, `+dirty` when the tree is dirty) and
+  `status` reports it, so "which build is loaded?" is one line instead of a
+  hand-run checksum; `scripts/update-vendor.sh` builds and mirrors `dist/` into
+  the vendored copy and prints the restart reminder. (item 15)
+
+### Fixed
+- The export no longer ships `project.time_active`, which the app rewrites
+  continuously — one activity bump used to rewrite every shard of that project
+  (26 files per push on a 26-session project).
+- A V2 shard carrying `todo`/`session_share` rows is no longer rolled back by the
+  foreign key against the legacy `session` table. (item 11)
+- The vendored plugin entrypoint travels again: the unanchored `plugin/` line in
+  the generated `.gitignore` was swallowing `vendor/…/dist/plugin/`. (item 12)
+- `service.json` is ignored, so the V2 service password stops being committed.
+  (item 10)
+
+### Changed
+- The export compares uncompressed content and canonical row order, and rebases
+  that only touch derived paths (`_sessions/`, `_state/`, `_data/`) resolve
+  automatically. (item 6)
+- One schema family per shard (item 7), V2 event shapes and per-location
+  instances (item 8), and sync progress toasts in the V2 TUI (item 9).
 
 ## 3.0.1
 
