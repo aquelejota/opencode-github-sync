@@ -349,6 +349,9 @@ async function maybeExportSessions(ctx) {
     if (result.written.length > 0) {
         ctx.reporter.detail(`Exported ${result.written.length} session(s)`);
     }
+    if (result.tombstoned > 0) {
+        ctx.reporter.detail(`Recorded ${result.tombstoned} session deletion(s) — the other machine will apply them`);
+    }
     return { exported: result.written.length, skipped: result.skippedTooLarge.length };
 }
 async function maybeImportSessions(ctx) {
@@ -370,7 +373,13 @@ async function maybeImportSessions(ctx) {
     if (result.skippedV2Only > 0) {
         ctx.reporter.warn(`Skipped ${result.skippedV2Only} OpenCode 2 session shard(s) — this database has no session_v2 table yet.`);
     }
-    return { imported: result.imported, skipped: result.skippedOlder + result.skippedV2Only };
+    if (result.deleted > 0) {
+        ctx.reporter.detail(`Deleted ${result.deleted} session(s) deleted on another machine`);
+    }
+    return {
+        imported: result.imported,
+        skipped: result.skippedOlder + result.skippedV2Only + result.skippedTombstoned,
+    };
 }
 export function status(options = {}) {
     const roots = options.roots ?? getRoots();

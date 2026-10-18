@@ -718,3 +718,205 @@ describe("sanitizeId", () => {
     expect(sanitizeId("a/b\\c")).toBe("a_b_c");
   });
 });
+
+// ── Session tombstones (R1) ─────────────────────────────────────────────────
+// A deletion made on one machine has to reach the other. The import used to only
+// upsert, so the other machine's database kept the row and its next export
+// recreated the shard — the session came back.
+
+describe("session tombstones", () => {
+  const repoDir = (): string => path.join(root, "repo");
+  const shard = (id: string): string =>
+    path.join(repoDir(), "_sessions", `${sanitizeId(id)}.json.gz`);
+  const marker = (id: string): string =>
+    path.join(repoDir(), "_sessions", "_deleted", `${sanitizeId(id)}.json`);
+
+  const writeMarker = (id: string, deletedAt: number): void => {
+    fs.mkdirSync(path.dirname(marker(id)), { recursive: true });
+    fs.writeFileSync(marker(id), JSON.stringify({ id, deletedAt }));
+  };
+
+  /** Delete a session the way the UI does: row plus children. */
+  const deleteLocally = async (file: string, id: string): Promise<void> => {
+    const db = await openDatabase(file);
+    for (const table of ["todo", "part", "message"]) {
+      db.prepare(`DELETE FROM ${table} WHERE session_id = ?`).run(id);
+    }
+    db.prepare("DELETE FROM session WHERE id = ?").run(id);
+    db.close();
+  };
+
+  const count = async (file: string, sql: string, ...params: unknown[]): Promise<number> => {
+    const db = await openDatabase(file, { readOnly: true });
+    const rows = db.prepare(sql).all(...params) as unknown[];
+    db.close();
+    return rows.length;
+  };
+
+  it("records a marker when a session is gone from the database", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const source = path.join(root, "db.sqlite");
+    await makeDatabase(source, now);
+
+    await exportSessions(source, repoDir(), { ...settings(), now }, silentReporter);
+    expect(fs.existsSync(marker("ses_recent"))).toBe(false);
+
+    await deleteLocally(source, "ses_recent");
+    const again = await exportSessions(
+      source,
+      repoDir(),
+      { ...settings(), now: now + 1000 },
+      silentReporter,
+    );
+
+    expect(again.tombstoned).toBe(1);
+    expect(fs.existsSync(shard("ses_recent"))).toBe(false);
+    const written = JSON.parse(fs.readFileSync(marker("ses_recent"), "utf8")) as {
+      id: string;
+      deletedAt: number;
+    };
+    expect(written.id).toBe("ses_recent");
+    expect(written.deletedAt).toBe(now + 1000);
+  });
+
+  it("records no marker for a session that only left the retention window", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const source = path.join(root, "db.sqlite");
+    await makeDatabase(source, now);
+
+    await exportSessions(source, repoDir(), { ...settings({ days: 365 }), now }, silentReporter);
+    expect(fs.existsSync(shard("ses_old"))).toBe(true);
+
+    const narrowed = await exportSessions(
+      source,
+      repoDir(),
+      { ...settings(), now },
+      silentReporter,
+    );
+
+    expect(narrowed.tombstoned).toBe(0);
+    expect(fs.existsSync(shard("ses_old"))).toBe(false);
+    expect(fs.existsSync(path.dirname(marker("ses_old")))).toBe(false);
+  });
+
+  it("applies a marker on import: deletes the row and its children, ignores the shard", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const source = path.join(root, "source.sqlite");
+    const target = path.join(root, "target.sqlite");
+    await makeDatabase(source, now);
+    await exportSessions(source, repoDir(), { ...settings(), now }, silentReporter);
+
+    const empty = await openDatabase(target);
+    empty.exec(SCHEMA);
+    empty.close();
+    await importSessions(target, repoDir(), silentReporter);
+    expect(await count(target, "SELECT id FROM session WHERE id = ?", "ses_recent")).toBe(1);
+
+    // The marker arrives with the shard still in the repository.
+    writeMarker("ses_recent", now + 1000);
+    const result = await importSessions(target, repoDir(), silentReporter);
+
+    expect(result.deleted).toBe(1);
+    expect(result.skippedTombstoned).toBe(1);
+    expect(await count(target, "SELECT id FROM session WHERE id = ?", "ses_recent")).toBe(0);
+    for (const table of ["message", "part", "todo"]) {
+      expect(await count(target, `SELECT 1 FROM ${table} WHERE session_id = ?`, "ses_recent")).toBe(
+        0,
+      );
+    }
+  });
+
+  it("keeps a session resumed after the deletion and drops the marker on export", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const source = path.join(root, "db.sqlite");
+    await makeDatabase(source, now);
+    await exportSessions(source, repoDir(), { ...settings(), now }, silentReporter);
+
+    // Marker older than the local row: the session was touched after the deletion.
+    writeMarker("ses_recent", now - 2 * DAY);
+    const imported = await importSessions(source, repoDir(), silentReporter);
+    expect(imported.deleted).toBe(0);
+
+    const exported = await exportSessions(
+      source,
+      repoDir(),
+      { ...settings(), now },
+      silentReporter,
+    );
+    expect(exported.revived).toBe(1);
+    expect(fs.existsSync(marker("ses_recent"))).toBe(false);
+  });
+
+  it("stays deleted after the other machine exports it back", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const machineA = path.join(root, "a.sqlite");
+    const machineB = path.join(root, "b.sqlite");
+    await makeDatabase(machineA, now);
+    await makeDatabase(machineB, now);
+
+    // A publishes, B imports: both know the session.
+    await exportSessions(machineA, repoDir(), { ...settings(), now }, silentReporter);
+    await importSessions(machineB, repoDir(), silentReporter);
+
+    // A deletes it and publishes the marker (its shard is pruned with it).
+    await deleteLocally(machineA, "ses_recent");
+    await exportSessions(machineA, repoDir(), { ...settings(), now: now + 1000 }, silentReporter);
+
+    // B still has the row; its export must honour the marker instead of
+    // republishing the session.
+    const fromB = await exportSessions(
+      machineB,
+      repoDir(),
+      { ...settings(), now: now + 2000 },
+      silentReporter,
+    );
+    expect(fromB.written).not.toContain("ses_recent");
+    expect(fs.existsSync(shard("ses_recent"))).toBe(false);
+
+    // A pulls again: nothing comes back.
+    const backAtA = await importSessions(machineA, repoDir(), silentReporter);
+    expect(backAtA.imported).toBe(0);
+    expect(await count(machineA, "SELECT id FROM session WHERE id = ?", "ses_recent")).toBe(0);
+
+    // B applies the marker on its next pull.
+    const appliedAtB = await importSessions(machineB, repoDir(), silentReporter);
+    expect(appliedAtB.deleted).toBe(1);
+    expect(await count(machineB, "SELECT id FROM session WHERE id = ?", "ses_recent")).toBe(0);
+  });
+});
+
+describe("session tombstones × generations", () => {
+  it("a V1 database neither tombsstones nor removes V2 shards it cannot read", async () => {
+    if (!available) return;
+    const now = Date.now();
+    const source = path.join(root, "v1.sqlite");
+    const repo = path.join(root, "repo");
+    await makeDatabase(source, now);
+
+    // A V2 shard for a session this (V1) database cannot import.
+    const v2Shard = {
+      formatVersion: 1,
+      generation: "v2",
+      exportedAt: now,
+      session: { id: "ses_v2only", project_id: "prj_1", time_created: now, time_updated: now },
+      tables: {},
+    };
+    const dir = path.join(repo, "_sessions");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "ses_v2only.json.gz"),
+      gzipSync(Buffer.from(JSON.stringify(v2Shard))),
+    );
+
+    const result = await exportSessions(source, repo, { ...settings(), now }, silentReporter);
+
+    expect(result.tombstoned).toBe(0);
+    expect(fs.existsSync(path.join(dir, "ses_v2only.json.gz"))).toBe(true);
+    expect(fs.existsSync(path.join(dir, "_deleted", "ses_v2only.json"))).toBe(false);
+  });
+});

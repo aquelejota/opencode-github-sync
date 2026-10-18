@@ -128,6 +128,16 @@ Base: **opencode-github-sync 3.0.1** (MIT) by [@doomsday616](https://github.com/
 
 **Note.** The plugin entrypoint is what the local bridge plugin re-exports (`plugins/sync-fork.js` → `vendor/.../dist/plugin/index.js`), so a stale copy silently disables sync on that machine; restarting the service does not fix it, because nothing pulls the file.
 
+## 13. Deletions travel: session tombstones (2026-10-18)
+
+**Problem.** The import only ever upserted (`importSessions` has no `DELETE`), so a session deleted on one machine did not reach the other: the other machine's database kept the row, its export rebuilt the shard, and the next pull imported it back. The workaround was a hand-written script carrying the explicit id list, run on the other machine *before* its first push.
+
+**Fix.** The export writes a deletion marker under `_sessions/_deleted/<id>.json` (`{ id, deletedAt }`) when a shard disappears **because the session is gone from the local database** — and only then: a session that merely left the retention window (`days`/`maxSessions`) still has its row and produces no marker. The import reads the markers, deletes the local row (children first — `todo`, `message`, `part`, `session_share`, `session_message`, … then the session row) and skips the matching shard. Last-writer-wins still applies: when the local row (or the incoming shard) is newer than the marker, the session was resumed after the deletion, so it is kept or imported and the export drops the marker. The export also refuses to publish a tombstoned session that has not changed since the deletion, which stops the ping-pong at its source.
+
+**Generation guard.** A V1 database cannot import V2 shards, so it now leaves them alone entirely: no marker, no removal. Until now a V1 machine could delete a V2 machine's shards while pruning — "never downgrade" only covered selected sessions.
+
+**Tests.** `tests/sessions.test.ts` → "session tombstones": marker written on deletion; no marker for the retention window; import deletes the row and its children and ignores the shard; a session resumed after the deletion survives and the marker is dropped; the two-machine cycle (delete on A, export on B, pull on A keeps it deleted, B applies the marker). Plus "a V1 database neither tombstones nor removes V2 shards it cannot read". 127 green.
+
 ## Migration notes
 
 - The first export after switching rewrites every shard once, because the stable `exportedAt` value differs from the old wall-clock one. One large commit, then incremental.

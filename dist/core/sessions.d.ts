@@ -42,6 +42,10 @@ export interface ExportResult {
         title: string;
         bytes: number;
     }[];
+    /** Deletion markers written because the session is gone from the database. */
+    tombstoned: number;
+    /** Markers dropped because the session was resumed after being deleted. */
+    revived: number;
     considered: number;
 }
 export interface ImportResult {
@@ -49,6 +53,10 @@ export interface ImportResult {
     skippedOlder: number;
     /** V2 shards skipped whole because the local database has no `session_v2`. */
     skippedV2Only: number;
+    /** Local sessions deleted because another machine deleted them. */
+    deleted: number;
+    /** Shards ignored because their session is tombstoned and not newer. */
+    skippedTombstoned: number;
     failed: {
         file: string;
         reason: string;
@@ -56,6 +64,21 @@ export interface ImportResult {
 }
 /** Session ids are opaque; keep them filesystem-safe without losing identity. */
 export declare function sanitizeId(id: string): string;
+/** A deletion marker: "this session was deleted on some machine at `deletedAt`". */
+export interface Tombstone {
+    id: string;
+    deletedAt: number;
+}
+/**
+ * Read every deletion marker in `<repo>/_sessions/_deleted`.
+ *
+ * The export writes a marker when a shard disappears because the session is gone
+ * from the local database — not when it only left the retention window. The
+ * import applies it, which is what makes a deletion travel: the import used to
+ * only upsert, so a session deleted on one machine came back from the other
+ * machine's next export (its database still had the row).
+ */
+export declare function readTombstones(repoRoot: string): Map<string, number>;
 /**
  * Choose which sessions to export.
  *

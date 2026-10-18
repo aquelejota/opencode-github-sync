@@ -7,7 +7,7 @@ Numbered independently from `CHANGES.md` (which documents what is already done).
 
 ## R1. Deletions do not travel: session tombstone + GC
 
-**Status:** open — to discuss before implementing.
+**Status:** done (2026-10-18) — the tombstone half is implemented, see `CHANGES.md` item 13. The GC half of the 2026-10-18 update below is now **R2**.
 **Raised:** 2026-10-17 (Ryzendeb, "fix restante" round: 79 sessions were deleted
 locally and would come back from the other machine on its next export).
 
@@ -99,3 +99,29 @@ session reappears on the machine where it was deleted, some minutes later.
   the Ryzendeb), so nothing was lost — but the round needed a hand-written script
   and a "run before the first push" ordering constraint, which is exactly the kind
   of footgun this item removes.
+
+---
+
+## R2. The shard history grows without bound
+
+**Status:** open — needs a decision and a coordinated rewrite; raised 2026-10-18.
+
+Every push rewrites the whole shard of each session that changed (that is the
+format that makes cross-machine comparison cheap), and nothing is ever pruned
+from history. Measured on the real repository: `.git` is **7.2 GB** locally, the
+remote is around **10 GB**, and the first fetch after three offline weeks pulled
+**12,562 objects** as a single **3.33 GB** delta.
+
+Options on the table:
+
+1. **One-off rewrite** — squash/filter the history (`git filter-repo` or a fresh
+   root commit), force-push, and have both machines re-clone. Smallest effort,
+   but loses history and needs both machines to agree on the moment.
+2. **Periodic compaction** — a command in the fork that keeps the last N days of
+   history (or a single state commit) and force-pushes with a lease; the pull
+   already resets the worktree, so the other machine absorbs it. Needs a rule for
+   "never rewrite while the other machine has unpushed commits".
+3. **Change the storage format** — append-only deltas per session instead of
+   whole shards. Most work, best long-term, and it interacts with R1's markers.
+
+Not to be improvised: it rewrites a shared remote.

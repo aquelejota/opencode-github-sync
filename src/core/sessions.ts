@@ -121,6 +121,10 @@ export interface ExportResult {
   /** Sessions whose shard on disk already had this exact content. */
   unchanged: string[];
   skippedTooLarge: { id: string; title: string; bytes: number }[];
+  /** Deletion markers written because the session is gone from the database. */
+  tombstoned: number;
+  /** Markers dropped because the session was resumed after being deleted. */
+  revived: number;
   considered: number;
 }
 
@@ -129,6 +133,10 @@ export interface ImportResult {
   skippedOlder: number;
   /** V2 shards skipped whole because the local database has no `session_v2`. */
   skippedV2Only: number;
+  /** Local sessions deleted because another machine deleted them. */
+  deleted: number;
+  /** Shards ignored because their session is tombstoned and not newer. */
+  skippedTombstoned: number;
   failed: { file: string; reason: string }[];
 }
 
@@ -139,6 +147,68 @@ function shardPath(repoRoot: string, sessionId: string): string {
 /** Session ids are opaque; keep them filesystem-safe without losing identity. */
 export function sanitizeId(id: string): string {
   return id.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+/** Folder inside the shard directory where deletion markers live. */
+const TOMBSTONE_DIR = "_deleted";
+
+/** A deletion marker: "this session was deleted on some machine at `deletedAt`". */
+export interface Tombstone {
+  id: string;
+  deletedAt: number;
+}
+
+function tombstonesDir(repoRoot: string): string {
+  return path.join(repoRoot, SESSIONS_DIR, TOMBSTONE_DIR);
+}
+
+function tombstonePath(repoRoot: string, sessionId: string): string {
+  return path.join(tombstonesDir(repoRoot), `${sanitizeId(sessionId)}.json`);
+}
+
+/**
+ * Read every deletion marker in `<repo>/_sessions/_deleted`.
+ *
+ * The export writes a marker when a shard disappears because the session is gone
+ * from the local database — not when it only left the retention window. The
+ * import applies it, which is what makes a deletion travel: the import used to
+ * only upsert, so a session deleted on one machine came back from the other
+ * machine's next export (its database still had the row).
+ */
+export function readTombstones(repoRoot: string): Map<string, number> {
+  const dir = tombstonesDir(repoRoot);
+  const tombstones = new Map<string, number>();
+  if (!fs.existsSync(dir)) return tombstones;
+  for (const entry of fs.readdirSync(dir)) {
+    if (!entry.endsWith(".json")) continue;
+    try {
+      const parsed = JSON.parse(
+        fs.readFileSync(path.join(dir, entry), "utf8"),
+      ) as Partial<Tombstone>;
+      if (typeof parsed?.id === "string" && Number.isFinite(parsed.deletedAt)) {
+        tombstones.set(parsed.id, Number(parsed.deletedAt));
+      }
+    } catch {
+      // A malformed marker must never block a sync.
+    }
+  }
+  return tombstones;
+}
+
+/** Write the marker unless one already exists — the first deletion wins. */
+function writeTombstone(repoRoot: string, sessionId: string, deletedAt: number): boolean {
+  const file = tombstonePath(repoRoot, sessionId);
+  if (fs.existsSync(file)) return false;
+  ensureDir(path.dirname(file));
+  fs.writeFileSync(file, `${JSON.stringify({ id: sessionId, deletedAt }, null, 2)}\n`);
+  return true;
+}
+
+function removeTombstone(repoRoot: string, sessionId: string): boolean {
+  const file = tombstonePath(repoRoot, sessionId);
+  if (!fs.existsSync(file)) return false;
+  fs.rmSync(file, { force: true });
+  return true;
 }
 
 function readRows(db: SqliteDatabase, sql: string, params: unknown[]): Record<string, unknown>[] {
@@ -284,7 +354,14 @@ export async function exportSessions(
   options: SelectOptions,
   reporter: Reporter,
 ): Promise<ExportResult> {
-  const result: ExportResult = { written: [], unchanged: [], skippedTooLarge: [], considered: 0 };
+  const result: ExportResult = {
+    written: [],
+    unchanged: [],
+    skippedTooLarge: [],
+    tombstoned: 0,
+    revived: 0,
+    considered: 0,
+  };
   if (!fs.existsSync(databaseFile)) return result;
 
   const db = await openDatabase(databaseFile, { readOnly: true });
@@ -297,12 +374,33 @@ export async function exportSessions(
     const sessions = selectSessions(db, options);
     result.considered = sessions.length;
 
+    const tombstones = readTombstones(repoRoot);
+    const deletedAt = options.now ?? Date.now();
+    // Ids that still exist locally (both schema families). A shard whose id is
+    // missing here was deleted, not merely aged out of the retention window.
+    const localIds = new Set<string>();
+    for (const table of existingTables(db, [V1_SESSION_TABLE, V2_SESSION_TABLE])) {
+      for (const row of readRows(db, `SELECT id FROM "${table}"`, [])) {
+        localIds.add(String(row.id));
+      }
+    }
+
     const outDir = path.join(repoRoot, SESSIONS_DIR);
     ensureDir(outDir);
 
     const keep = new Set<string>();
 
     for (const session of sessions) {
+      const tombstone = tombstones.get(session.id);
+      if (tombstone !== undefined) {
+        if (tombstone >= session.timeUpdated) {
+          // Deleted on another machine and untouched since: never republish it.
+          continue;
+        }
+        // Resumed after the deletion — the live work wins over the marker.
+        if (removeTombstone(repoRoot, session.id)) result.revived++;
+      }
+
       const shard = buildShard(db, session.id, tables, sessionTable);
       const json = Buffer.from(JSON.stringify(shard));
       const file = shardPath(repoRoot, session.id);
@@ -340,7 +438,14 @@ export async function exportSessions(
       result.written.push(session.id);
     }
 
-    pruneShards(outDir, keep, options, reporter);
+    pruneShards(outDir, keep, options, reporter, {
+      localIds,
+      localV2: v2,
+      now: deletedAt,
+      onTombstone: () => {
+        result.tombstoned++;
+      },
+    });
   } finally {
     db.close();
   }
@@ -360,17 +465,53 @@ function pruneShards(
   keep: Set<string>,
   options: SelectOptions,
   reporter: Reporter,
+  state: {
+    localIds: Set<string>;
+    localV2: boolean;
+    now: number;
+    onTombstone: () => void;
+  },
 ): void {
   let removed = 0;
+  let tombstoned = 0;
   const includeFiles = new Set(options.include.map((id) => `${sanitizeId(id)}.json.gz`));
+  const repoRoot = path.dirname(outDir);
   for (const entry of fs.readdirSync(outDir)) {
     if (!entry.endsWith(".json.gz")) continue;
-    if (keep.has(entry) || includeFiles.has(entry)) continue;
-    fs.rmSync(path.join(outDir, entry), { force: true });
+    if (keep.has(entry)) continue;
+    const file = path.join(outDir, entry);
+    const info = readShardInfo(file);
+    // A V1 machine cannot read V2 shards, so it must neither tombstone nor
+    // remove them — "never downgrade" applies to untouched shards too.
+    if (info?.generation === "v2" && !state.localV2) continue;
+    const id = readShardId(file);
+    // Ids absent from the database are deletions (by the user or the UI), not
+    // retention: record a marker so the other machine deletes them too.
+    if (id !== undefined && !state.localIds.has(id) && writeTombstone(repoRoot, id, state.now)) {
+      tombstoned++;
+      state.onTombstone();
+    }
+    // `include` keeps existing sessions beyond the window, but can never
+    // resurrect a deleted one.
+    if (id !== undefined && state.localIds.has(id) && includeFiles.has(entry)) continue;
+    fs.rmSync(file, { force: true });
     removed++;
   }
   if (removed > 0)
-    reporter.detail(`Removed ${removed} session shard(s) outside the retention window`);
+    reporter.detail(`Removed ${removed} session shard(s) (retention window or deleted locally)`);
+  if (tombstoned > 0) reporter.detail(`Recorded ${tombstoned} session deletion(s)`);
+}
+
+/** The session id inside a shard, for shards about to be pruned. */
+function readShardId(file: string): string | undefined {
+  const info = readShardInfo(file);
+  if (!info) return undefined;
+  try {
+    const shard = JSON.parse(info.json.toString("utf8")) as { session?: { id?: unknown } };
+    return typeof shard?.session?.id === "string" ? shard.session.id : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -461,12 +602,21 @@ export async function importSessions(
   repoRoot: string,
   reporter: Reporter,
 ): Promise<ImportResult> {
-  const result: ImportResult = { imported: 0, skippedOlder: 0, skippedV2Only: 0, failed: [] };
+  const result: ImportResult = {
+    imported: 0,
+    skippedOlder: 0,
+    skippedV2Only: 0,
+    deleted: 0,
+    skippedTombstoned: 0,
+    failed: [],
+  };
   const shardDir = path.join(repoRoot, SESSIONS_DIR);
   if (!fs.existsSync(shardDir)) return result;
 
+  const tombstones = readTombstones(repoRoot);
   const files = fs.readdirSync(shardDir).filter((f) => f.endsWith(".json.gz"));
-  if (files.length === 0) return result;
+  // A marker deletes a row, so a pull that only brings a marker still has work.
+  if (files.length === 0 && tombstones.size === 0) return result;
   if (!fs.existsSync(databaseFile)) {
     reporter.warn("No local OpenCode database yet — start OpenCode once, then pull again.");
     return result;
@@ -499,6 +649,29 @@ export async function importSessions(
       localTimes.set(String(row.id), Number(row.time_updated ?? 0));
     }
 
+    // Applying a deletion removes children first: the import never relies on
+    // SQLite's ON DELETE CASCADE being enabled in this connection.
+    const childTables = existingTables(db, [...V1_SESSION_TABLES, ...V2_SESSION_TABLES]).filter(
+      (table) => tableColumns(db, table).includes("session_id"),
+    );
+    const familyTables = existingTables(db, [V1_SESSION_TABLE, V2_SESSION_TABLE]);
+    const deleteSession = (sessionId: string): void => {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        for (const table of childTables) {
+          db.prepare(`DELETE FROM "${table}" WHERE session_id = ?`).run(sessionId);
+        }
+        for (const table of familyTables) {
+          db.prepare(`DELETE FROM "${table}" WHERE id = ?`).run(sessionId);
+        }
+        db.exec("COMMIT");
+      } catch (err) {
+        db.exec("ROLLBACK");
+        throw err;
+      }
+    };
+    const seen = new Set<string>();
+
     for (const file of files) {
       const full = path.join(shardDir, file);
       try {
@@ -506,6 +679,20 @@ export async function importSessions(
         const sessionId = String(shard.session.id);
         const incoming = Number(shard.session.time_updated ?? 0);
         const shardV2 = shard.generation === "v2";
+        seen.add(sessionId);
+
+        const tombstone = tombstones.get(sessionId);
+        if (tombstone !== undefined && incoming <= tombstone) {
+          // Deleted on another machine and this shard is not newer: the deletion
+          // wins (a resumed session updates `time_updated`, so it would win here).
+          if (localTimes.has(sessionId)) {
+            deleteSession(sessionId);
+            localTimes.delete(sessionId);
+            result.deleted++;
+          }
+          result.skippedTombstoned++;
+          continue;
+        }
 
         if (shardV2 && localSessionTable !== V2_SESSION_TABLE) {
           result.skippedV2Only++;
@@ -556,6 +743,21 @@ export async function importSessions(
         }
       } catch (err) {
         result.failed.push({ file, reason: (err as Error).message });
+      }
+    }
+
+    // Markers whose shard is not in this pull — the usual case: the machine that
+    // deleted the session also pruned the shard, so nothing else carries the id.
+    for (const [sessionId, deletedAt] of tombstones) {
+      if (seen.has(sessionId)) continue;
+      const local = localTimes.get(sessionId);
+      if (local === undefined || local > deletedAt) continue;
+      try {
+        deleteSession(sessionId);
+        localTimes.delete(sessionId);
+        result.deleted++;
+      } catch (err) {
+        result.failed.push({ file: `tombstone:${sessionId}`, reason: (err as Error).message });
       }
     }
   } finally {
