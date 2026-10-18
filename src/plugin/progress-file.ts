@@ -37,12 +37,17 @@ export function beginProgress(roots: Roots, action: string): void {
   }
 }
 
-export function appendProgress(roots: Roots, message: string, variant: string): void {
+export function appendProgress(
+  roots: Roots,
+  message: string,
+  variant: string,
+  notify = false,
+): void {
   try {
     fs.mkdirSync(roots.state, { recursive: true });
     fs.appendFileSync(
       progressFilePath(roots),
-      `${JSON.stringify({ kind: "toast", message, variant, at: Date.now() })}\n`,
+      `${JSON.stringify({ kind: "toast", message, variant, at: Date.now(), notify })}\n`,
     );
   } catch {
     // Same: never break a sync over the progress log.
@@ -52,6 +57,8 @@ export function appendProgress(roots: Roots, message: string, variant: string): 
 export interface ProgressToast {
   message: string;
   variant: string;
+  /** The reader should also raise a desktop notification. */
+  notify?: boolean;
 }
 
 /**
@@ -71,6 +78,9 @@ export function splitProgressLines(raw: string): ProgressToast[] {
       toasts.push({
         message: entry.message,
         variant: typeof entry.variant === "string" ? entry.variant : "info",
+        // Only present when true: keeps the parsed shape identical for
+        // callers (and tests) that predate the flag.
+        notify: entry.notify === true ? true : undefined,
       });
     } catch {
       // partial write or garbage

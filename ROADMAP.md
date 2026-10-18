@@ -104,7 +104,11 @@ session reappears on the machine where it was deleted, some minutes later.
 
 ## R2. The shard history grows without bound
 
-**Status:** open — needs a decision and a coordinated rewrite; raised 2026-10-18.
+**Status:** tooling done (2026-10-18) — see `CHANGES.md` item 14: the size nudge,
+`scripts/compact-sync-repo.sh` (squash) and the `/compact-sync` command. Executed on
+the real repository on 2026-10-18: `.git` went from **8.3 GB to ~0.4 GB**.
+Re-run it when the nudge says so (the two churn amplifiers were fixed in items 12/13,
+so growth is now a few hundred KB per push).
 
 Every push rewrites the whole shard of each session that changed (that is the
 format that makes cross-machine comparison cheap), and nothing is ever pruned

@@ -6,10 +6,12 @@ export declare function progressFilePath(roots?: Roots): string;
  * fresh run from entries it has already shown.
  */
 export declare function beginProgress(roots: Roots, action: string): void;
-export declare function appendProgress(roots: Roots, message: string, variant: string): void;
+export declare function appendProgress(roots: Roots, message: string, variant: string, notify?: boolean): void;
 export interface ProgressToast {
     message: string;
     variant: string;
+    /** The reader should also raise a desktop notification. */
+    notify?: boolean;
 }
 /**
  * Parse a chunk of the log into the toasts it carries. Pure on purpose: the

@@ -109,6 +109,68 @@ function toChangedFiles(result: GitResult, excludeRuntime: boolean): ChangedFile
 
 // ── Push ────────────────────────────────────────────────────────────────────
 
+/** Repository size at which the user is nudged to compact (1.5 GB). */
+export const REPO_SIZE_ALERT_BYTES = 1_500_000_000;
+/** Never repeat that nudge more often than this. */
+export const REPO_SIZE_ALERT_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Bytes the repository occupies, per git's own accounting (loose + packs). */
+export function repoBytes(root: string): number {
+  const out = git(["count-objects", "-v"], { cwd: root });
+  if (!out.ok) return 0;
+  const kib = (name: string): number => {
+    const match = out.stdout.match(new RegExp(`^${name}:\\s*(\\d+)`, "m"));
+    return match ? Number(match[1]) : 0;
+  };
+  return (kib("size") + kib("size-pack")) * 1024;
+}
+
+/** Pure decision: is it time to nudge about the repository size? */
+export function shouldWarnRepoSize(
+  bytes: number,
+  lastWarnAt: number,
+  now: number,
+  limit = REPO_SIZE_ALERT_BYTES,
+  interval = REPO_SIZE_ALERT_INTERVAL_MS,
+): boolean {
+  if (limit <= 0) return false;
+  if (bytes < limit) return false;
+  return now - lastWarnAt >= interval;
+}
+
+/**
+ * Nudge the user when the repository has grown past the threshold.
+ *
+ * Compacting rewrites the remote, so it stays a manual step: this only makes
+ * sure the user knows it is time and knows the command (`/compact-sync`). The
+ * state file lives outside the repository, so the nag costs no churn.
+ */
+function maybeWarnRepoSize(ctx: Context): void {
+  try {
+    const bytes = repoBytes(ctx.root);
+    const file = path.join(ctx.roots.state, "repo-size-alert.json");
+    let lastWarnAt = 0;
+    try {
+      lastWarnAt = Number(
+        (JSON.parse(fs.readFileSync(file, "utf8")) as { lastWarnAt?: number }).lastWarnAt ?? 0,
+      );
+    } catch {
+      // No marker yet: never warned.
+    }
+    const now = Date.now();
+    if (!shouldWarnRepoSize(bytes, lastWarnAt, now)) return;
+    fs.mkdirSync(ctx.roots.state, { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify({ lastWarnAt: now, bytes }, null, 2)}\n`);
+    const gb = (value: number): string => (value / 1073741824).toFixed(1);
+    ctx.reporter.warn(
+      `Sync repo at ${gb(bytes)} GB (limit ${gb(REPO_SIZE_ALERT_BYTES)} GB) — run /compact-sync to squash the shard history`,
+      { notify: true },
+    );
+  } catch {
+    // Housekeeping must never break a sync.
+  }
+}
+
 export async function push(options: SyncOptions = {}): Promise<SyncResult> {
   const ctx = prepare(options);
   const { root, branch, reporter } = ctx;
@@ -118,6 +180,7 @@ export async function push(options: SyncOptions = {}): Promise<SyncResult> {
   ensureRepo({ root, remote: ctx.remote, branch });
   assertRemoteReachable(root, branch, "Push", true);
   writeRepoMetadata(root);
+  maybeWarnRepoSize(ctx);
 
   try {
     return await runPush(ctx);

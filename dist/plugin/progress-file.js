@@ -31,10 +31,10 @@ export function beginProgress(roots, action) {
         // The progress log is cosmetic: a sync must never fail over it.
     }
 }
-export function appendProgress(roots, message, variant) {
+export function appendProgress(roots, message, variant, notify = false) {
     try {
         fs.mkdirSync(roots.state, { recursive: true });
-        fs.appendFileSync(progressFilePath(roots), `${JSON.stringify({ kind: "toast", message, variant, at: Date.now() })}\n`);
+        fs.appendFileSync(progressFilePath(roots), `${JSON.stringify({ kind: "toast", message, variant, at: Date.now(), notify })}\n`);
     }
     catch {
         // Same: never break a sync over the progress log.
@@ -60,6 +60,9 @@ export function splitProgressLines(raw) {
             toasts.push({
                 message: entry.message,
                 variant: typeof entry.variant === "string" ? entry.variant : "info",
+                // Only present when true: keeps the parsed shape identical for
+                // callers (and tests) that predate the flag.
+                notify: entry.notify === true ? true : undefined,
             });
         }
         catch {

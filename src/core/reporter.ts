@@ -24,7 +24,11 @@ export interface Reporter {
   step(message: string): void;
   info(message: string): void;
   success(message: string): void;
-  warn(message: string): void;
+  /**
+   * `notify` asks the surface for a desktop notification on top of the toast —
+   * reserved for rare, actionable alerts (the repository growth warning).
+   */
+  warn(message: string, options?: { notify?: boolean }): void;
   error(message: string): void;
   detail(message: string): void;
   changes(summary: ChangeSummary, files: ChangedFile[]): void;

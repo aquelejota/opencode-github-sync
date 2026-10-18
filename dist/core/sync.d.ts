@@ -27,6 +27,14 @@ export interface SyncResult {
 declare class SyncError extends Error {
     constructor(message: string);
 }
+/** Repository size at which the user is nudged to compact (1.5 GB). */
+export declare const REPO_SIZE_ALERT_BYTES = 1500000000;
+/** Never repeat that nudge more often than this. */
+export declare const REPO_SIZE_ALERT_INTERVAL_MS: number;
+/** Bytes the repository occupies, per git's own accounting (loose + packs). */
+export declare function repoBytes(root: string): number;
+/** Pure decision: is it time to nudge about the repository size? */
+export declare function shouldWarnRepoSize(bytes: number, lastWarnAt: number, now: number, limit?: number, interval?: number): boolean;
 export declare function push(options?: SyncOptions): Promise<SyncResult>;
 export declare function pull(options?: SyncOptions): Promise<SyncResult>;
 export interface StatusResult {

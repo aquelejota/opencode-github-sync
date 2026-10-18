@@ -11,6 +11,7 @@
  * in the same style as the other local plugins: a tiny bridge file re-exports
  * this module from the vendored `dist`.
  */
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { getRoots } from "./core/paths.js";
 import { progressFilePath, splitProgressLines } from "./plugin/progress-file.js";
@@ -42,6 +43,21 @@ export default {
         ctx?.ui?.toast?.show?.({ title: "sync", message, variant, duration: TOAST_DURATION_MS });
       } catch {
         // The TUI is not reachable (headless) — nothing to do.
+      }
+    };
+
+    // Desktop notification for alerts the user should see even without looking
+    // at the TUI. Best effort: no notifier (or no session bus) is not an error.
+    const notifyDesktop = (message: string) => {
+      try {
+        const child = spawn("notify-send", ["opencode sync", message], {
+          detached: true,
+          stdio: "ignore",
+        });
+        child.on("error", () => {});
+        child.unref();
+      } catch {
+        // Ignored on purpose.
       }
     };
 
@@ -82,6 +98,7 @@ export default {
         offset += Buffer.byteLength(complete, "utf8");
         for (const toast of splitProgressLines(complete)) {
           show(toast.message, toast.variant);
+          if (toast.notify) notifyDesktop(toast.message);
         }
       } catch {
         // File rotated mid-read; the next tick will pick it up.

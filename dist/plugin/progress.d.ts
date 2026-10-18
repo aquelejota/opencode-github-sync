@@ -19,6 +19,8 @@ export interface LogMessage {
     action: SyncAction;
     level: LogLevel;
     message: string;
+    /** Ask the TUI to raise a desktop notification as well as a toast. */
+    notify?: boolean;
 }
 export interface ChangesMessage {
     type: "changes";

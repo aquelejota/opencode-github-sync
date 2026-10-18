@@ -35,7 +35,7 @@ async function run() {
         step: (message) => post({ type: "log", action, level: "step", message }),
         info: (message) => post({ type: "log", action, level: "info", message }),
         success: (message) => post({ type: "log", action, level: "success", message }),
-        warn: (message) => post({ type: "log", action, level: "warn", message }),
+        warn: (message, options) => post({ type: "log", action, level: "warn", message, notify: options?.notify === true }),
         error: (message) => post({ type: "log", action, level: "error", message }),
         detail: (message) => post({ type: "log", action, level: "detail", message }),
         changes: (summary, files) => post({ type: "changes", action, count: files.length }),

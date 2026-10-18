@@ -101,9 +101,9 @@ function runSync(client: any, action: SyncAction): Promise<SyncOutcome> {
      * is one, and through the progress log the V2 CLI plugin (`src/tui.ts`)
      * tails. `client` is undefined on V2, where the log is the only channel.
      */
-    const show = (message: string, variant: ToastVariant) => {
+    const show = (message: string, variant: ToastVariant, notify = false) => {
       void toast(client, message, variant);
-      appendProgress(roots, message, variant);
+      appendProgress(roots, message, variant, notify);
     };
     let settled = false;
     let announced = false;
@@ -169,6 +169,9 @@ function runSync(client: any, action: SyncAction): Promise<SyncOutcome> {
             void log(client, "debug", message.message);
           } else {
             void log(client, message.level === "success" ? "info" : message.level, message.message);
+            // Alerts that are worth a desktop notification also become a toast:
+            // on V2 the log channel is not visible in the TUI.
+            if (message.notify) show(message.message, "warning", true);
           }
           return;
         case "changes":

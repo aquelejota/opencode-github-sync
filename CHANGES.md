@@ -138,6 +138,14 @@ Base: **opencode-github-sync 3.0.1** (MIT) by [@doomsday616](https://github.com/
 
 **Tests.** `tests/sessions.test.ts` → "session tombstones": marker written on deletion; no marker for the retention window; import deletes the row and its children and ignores the shard; a session resumed after the deletion survives and the marker is dropped; the two-machine cycle (delete on A, export on B, pull on A keeps it deleted, B applies the marker). Plus "a V1 database neither tombstones nor removes V2 shards it cannot read". 127 green.
 
+## 14. Repository growth: a size nudge, a compaction script and `/compact-sync` (2026-10-18)
+
+**Problem.** Every push rewrites the whole shard of each session that changed, and nothing ever prunes history: the sync repository reached **8.3 GB of `.git` against 389 MB of content** (1,929 commits in 59 days). Items 12 and 13 removed the two churn amplifiers (the cross-machine ping-pong and the volatile `project.time_active`); what remained is that trimming history is a decision only the user can make, and it must be made at a moment when both machines are quiet.
+
+**Fix.** Three pieces. **(1)** `push()` measures the repository with `git count-objects -v` and, once past `REPO_SIZE_ALERT_BYTES` (1.5 GB) and at most once a week, warns with `{ notify: true }` — on V2 that becomes a toast *and* a `notify-send` desktop notification, and the text names the command to run. The throttle marker lives in the state root, outside the repository, so the nudge adds no churn. **(2)** `scripts/compact-sync-repo.sh` (shipped in the synced config) performs the squash: it refuses unless the worktree is clean and the branch is exactly in sync, pauses `autoPushOnIdle` for the duration, creates a single orphan commit with the current content, force-pushes with `--force-with-lease`, gc's locally and prints the exact steps for the other machine. The content does not change, so nothing needs re-importing — only the disk is recovered. **(3)** `commands/compact-sync.md` exposes it as `/compact-sync`; its shell block runs the read-only `--check` (shell blocks run outside the tool permission flow, so the destructive part stays a tool call with confirmation).
+
+**Tests.** 5 new cases in `tests/growth.test.ts`: quiet below the limit, speaking up past it, the weekly interval, disabled with a zero limit, and `repoBytes` against a real temporary repository. 133 green.
+
 ## Migration notes
 
 - The first export after switching rewrites every shard once, because the stable `exportedAt` value differs from the old wall-clock one. One large commit, then incremental.
